@@ -46,6 +46,32 @@ pub(crate) struct HttpTransport {
     ntlm_cache: Mutex<Option<NtlmSessionCache>>,
 }
 
+/// Strip scheme, userinfo, port, and path from a host string.
+///
+/// Defensive: callers are supposed to pass `"hostname"` or `"10.0.0.1"`,
+/// but if they accidentally pass `"http://evil.com/path"` we keep just
+/// `"evil.com"` and log the deviation. IPv6 literals (`[::1]`) are
+/// preserved as-is because `:` inside brackets is part of the address.
+fn sanitize_host(input: &str) -> String {
+    let mut s = input;
+    if let Some(rest) = s.split_once("://") {
+        s = rest.1;
+    }
+    if let Some((_, rest)) = s.rsplit_once('@') {
+        s = rest;
+    }
+    if let Some((host_part, _)) = s.split_once('/') {
+        s = host_part;
+    }
+    // For non-bracketed IPv6 / hostnames, drop a trailing :port.
+    if !s.starts_with('[')
+        && let Some((host_part, _)) = s.rsplit_once(':')
+    {
+        s = host_part;
+    }
+    s.to_string()
+}
+
 impl HttpTransport {
     /// Create a new HTTP transport from the given configuration and credentials.
     ///
@@ -161,9 +187,23 @@ impl HttpTransport {
     }
 
     /// Build the WinRM endpoint URL for a given host.
+    ///
+    /// `host` is expected to be a bare hostname or IP literal — no scheme,
+    /// no port, no userinfo. If suspect characters (`/`, `@`, `://`) are
+    /// detected they are stripped and a WARN is logged so the call still
+    /// produces a syntactically valid URL but the operator notices the
+    /// misuse instead of silently sending credentials to a forged host.
     pub(crate) fn endpoint(&self, host: &str) -> String {
         let scheme = if self.config.use_tls { "https" } else { "http" };
-        format!("{scheme}://{host}:{}/wsman", self.config.port)
+        let sanitized = sanitize_host(host);
+        if sanitized != host {
+            tracing::warn!(
+                original = host,
+                sanitized = %sanitized,
+                "host string contained scheme/path/userinfo; using sanitized form"
+            );
+        }
+        format!("{scheme}://{sanitized}:{}/wsman", self.config.port)
     }
 
     /// Access the transport configuration.
@@ -399,6 +439,24 @@ mod tests {
     fn endpoint_http() {
         let transport = basic_transport(5985);
         assert_eq!(transport.endpoint("10.0.0.1"), "http://10.0.0.1:5985/wsman");
+    }
+
+    #[test]
+    fn sanitize_host_strips_scheme_and_path() {
+        assert_eq!(sanitize_host("http://evil.com/x"), "evil.com");
+        assert_eq!(sanitize_host("https://evil.com:1234/path"), "evil.com");
+        assert_eq!(sanitize_host("user:pw@host.com"), "host.com");
+    }
+
+    #[test]
+    fn sanitize_host_preserves_bare_hostname_and_ip() {
+        assert_eq!(sanitize_host("plain.host"), "plain.host");
+        assert_eq!(sanitize_host("10.0.0.1"), "10.0.0.1");
+    }
+
+    #[test]
+    fn sanitize_host_preserves_ipv6_literal() {
+        assert_eq!(sanitize_host("[fe80::1]"), "[fe80::1]");
     }
 
     #[test]
