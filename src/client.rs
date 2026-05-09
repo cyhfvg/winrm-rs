@@ -2804,4 +2804,143 @@ mod tests {
             "run_wql should return items, got: {result}"
         );
     }
+
+    #[tokio::test]
+    async fn open_psrp_shell_returns_shell_with_id() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>PSRP-SH</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client
+            .open_psrp_shell(
+                "127.0.0.1",
+                "AAAA",
+                "http://schemas.microsoft.com/powershell/Microsoft.PowerShell",
+            )
+            .await
+            .unwrap();
+        assert_eq!(shell.shell_id(), "PSRP-SH");
+    }
+
+    #[tokio::test]
+    async fn run_wql_caps_items_at_max_output_bytes() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        // Big enumerate response with EnumerationContext so the Pull loop iterates,
+        // padded so each iteration adds > 1 KiB to the items string.
+        let big = "X".repeat(2048);
+        let chunk = format!(
+            r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+              xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+              <s:Body>
+                <wsen:EnumerateResponse>
+                  <wsen:EnumerationContext>CTX-1</wsen:EnumerationContext>
+                  <wsen:Items><p:Win32_OS><p:Name>{big}</p:Name></p:Win32_OS></wsen:Items>
+                </wsen:EnumerateResponse>
+              </s:Body>
+            </s:Envelope>"#
+        );
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(chunk))
+            .mount(&server)
+            .await;
+
+        let mut config = basic_config(port);
+        config.max_output_bytes = Some(1024);
+        let client = WinrmClient::new(config, test_creds()).unwrap();
+        let err = client
+            .run_wql("127.0.0.1", "SELECT * FROM Win32_OS", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WinrmError::Transfer(_)),
+            "expected Transfer cap error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_in_shell_caps_output_at_max_output_bytes() {
+        // Build 2 KiB of "A" base64-encoded so the receive response is
+        // bigger than our 1 KiB cap. The mock returns Receive responses
+        // forever (no Done state) — the cap should fire before we get
+        // there.
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        let big_b64 = base64::engine::general_purpose::STANDARD.encode(vec![b'A'; 2048]);
+        let receive_response = format!(
+            r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+                <rsp:Stream Name="stdout" CommandId="C">{big_b64}</rsp:Stream>
+            </rsp:ReceiveResponse></s:Body></s:Envelope>"#
+        );
+
+        // Create
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Execute
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Receive (and signal cleanup) — return data forever
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(receive_response))
+            .mount(&server)
+            .await;
+
+        let mut config = basic_config(port);
+        config.max_output_bytes = Some(1024);
+        let client = WinrmClient::new(config, test_creds()).unwrap();
+        let err = client
+            .run_command("127.0.0.1", "ipconfig", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WinrmError::Transfer(_)),
+            "expected Transfer cap error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_with_cancel_returns_cancelled_when_token_pre_cancelled() {
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let client = WinrmClient::new(basic_config(0), test_creds()).unwrap();
+        let err = client
+            .run_command_with_cancel("127.0.0.1", "ipconfig", &[], token)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WinrmError::Cancelled), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn run_powershell_with_cancel_returns_cancelled_when_token_pre_cancelled() {
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let client = WinrmClient::new(basic_config(0), test_creds()).unwrap();
+        let err = client
+            .run_powershell_with_cancel("127.0.0.1", "Get-Date", token)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WinrmError::Cancelled), "got: {err}");
+    }
 }

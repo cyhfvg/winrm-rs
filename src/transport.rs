@@ -700,4 +700,24 @@ mod tests {
         let transport = basic_transport(5985);
         assert!(transport.cert_handle.is_none());
     }
+
+    #[test]
+    fn invalid_proxy_url_returns_error() {
+        let config = WinrmConfig {
+            proxy: Some("not a url".into()),
+            ..Default::default()
+        };
+        let creds = WinrmCredentials::new("u", "p", "");
+        let result = HttpTransport::new(config, creds);
+        assert!(result.is_err(), "expected error for invalid proxy URL");
+    }
+
+    #[test]
+    fn endpoint_strips_scheme_and_path_silently() {
+        let transport = basic_transport(5985);
+        // Caller passed a polluted host string; sanitize_host pulls just
+        // the hostname and the URL is rebuilt with the configured scheme.
+        let url = transport.endpoint("http://evil.com/path");
+        assert_eq!(url, "http://evil.com:5985/wsman");
+    }
 }

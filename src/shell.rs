@@ -386,6 +386,7 @@ impl Drop for Shell<'_> {
 mod tests {
     use crate::client::WinrmClient;
     use crate::config::{AuthMethod, WinrmConfig, WinrmCredentials};
+    use crate::error::WinrmError;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1033,5 +1034,105 @@ mod tests {
         let output = shell.receive_next("RECV-CMD").await.unwrap();
         assert!(output.done);
         assert!(!output.stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shell_send_input_posts_to_endpoint() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        // Create
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Send
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        shell.send_input("CMD-1", b"hello", true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_signal_ctrl_c_posts_to_endpoint() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        // Create
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Signal
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        shell.signal_ctrl_c("CMD-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_with_cancel_returns_cancelled_when_pre_cancelled() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let err = shell
+            .run_command_with_cancel("ipconfig", &[], token)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WinrmError::Cancelled), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn shell_run_powershell_with_cancel_returns_cancelled_when_pre_cancelled() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let err = shell
+            .run_powershell_with_cancel("Get-Date", token)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WinrmError::Cancelled), "got: {err}");
     }
 }

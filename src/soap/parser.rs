@@ -836,4 +836,52 @@ mod tests {
         let result = parse_clixml(clixml);
         assert_eq!(String::from_utf8_lossy(&result), "aaabbb");
     }
+
+    #[test]
+    fn parse_command_id_missing_returns_missing_element() {
+        let xml = r"<s:Envelope><s:Body><something/></s:Body></s:Envelope>";
+        let err = parse_command_id(xml).unwrap_err();
+        assert!(matches!(err, SoapError::MissingElement(_)));
+    }
+
+    #[test]
+    fn extract_soap_fault_falls_back_to_faultstring() {
+        // Older SOAP 1.1 style fault uses <faultcode>/<faultstring>.
+        let xml = r"<s:Envelope><s:Body><s:Fault>
+            <faultcode>soap:Server</faultcode>
+            <faultstring>old style</faultstring>
+        </s:Fault></s:Body></s:Envelope>";
+        let fault = extract_soap_fault(xml).expect("fault parsed");
+        match fault {
+            SoapError::Fault { code, reason } => {
+                assert_eq!(code, "soap:Server");
+                assert_eq!(reason, "old style");
+            }
+            _ => panic!("expected Fault variant"),
+        }
+    }
+
+    #[test]
+    fn extract_soap_fault_returns_none_when_absent() {
+        let xml = "<s:Envelope><s:Body><something/></s:Body></s:Envelope>";
+        assert!(extract_soap_fault(xml).is_none());
+    }
+
+    #[test]
+    fn extract_subcode_value_empty_returns_none() {
+        // Subcode element exists but Value is empty.
+        let xml = r"<s:Subcode><s:Value></s:Value></s:Subcode>";
+        assert!(extract_subcode_value(xml).is_none());
+    }
+
+    #[test]
+    fn parse_enumerate_response_handles_empty_items() {
+        let xml = r#"<s:Envelope xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+            <s:Body><wsen:EnumerateResponse>
+                <wsen:EndOfSequence/>
+            </wsen:EnumerateResponse></s:Body></s:Envelope>"#;
+        let (items, context) = parse_enumerate_response(xml).unwrap();
+        assert!(items.is_empty(), "no <Items> tag should yield empty");
+        assert!(context.is_none());
+    }
 }

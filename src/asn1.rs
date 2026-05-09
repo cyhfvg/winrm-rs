@@ -599,6 +599,80 @@ mod tests {
     }
 
     #[test]
+    fn decode_spnego_token_neg_token_init_missing_mech_token() {
+        // APPLICATION[0] wrapper, OID, then [0] SEQUENCE without [2] mechToken
+        let oid = encode_tlv(TAG_OID, &[0x2a, 0x86, 0x48]);
+        let neg_token_init = encode_context_tag(0, &encode_sequence(&[]));
+        let mut contents = Vec::new();
+        contents.extend_from_slice(&oid);
+        contents.extend_from_slice(&neg_token_init);
+        let app0 = encode_tlv(0x60, &contents);
+        let err = decode_spnego_token(&app0).unwrap_err();
+        assert!(matches!(err, CredSspError::Asn1Decode(_)));
+    }
+
+    #[test]
+    fn decode_spnego_token_neg_token_resp_missing_response_token() {
+        // [1] NegTokenResp with empty SEQUENCE
+        let resp = encode_context_tag(1, &encode_sequence(&[]));
+        let err = decode_spnego_token(&resp).unwrap_err();
+        assert!(matches!(err, CredSspError::Asn1Decode(_)));
+    }
+
+    #[test]
+    fn decode_spnego_token_unknown_outer_tag() {
+        // Random tag (not 0x60 or 0xA1)
+        let data = encode_tlv(0x42, &[0x00]);
+        let err = decode_spnego_token(&data).unwrap_err();
+        assert!(matches!(err, CredSspError::Asn1Decode(_)));
+    }
+
+    #[test]
+    fn encode_spnego_response_with_mech_list_mic() {
+        // Drives the line `if let Some(mic) = mech_list_mic` branch.
+        let mic = vec![0u8; 16];
+        let resp = encode_spnego_response(b"ntlm-token", Some(&mic));
+        // Decode back and ensure NegTokenResp wraps something and MIC bytes
+        // appear in the encoded form.
+        assert!(!resp.is_empty());
+        assert!(resp.windows(16).any(|w| w == mic.as_slice()));
+    }
+
+    #[test]
+    fn decode_length_rejects_long_form_with_zero_num_bytes() {
+        // 0x80 = long-form prefix with num_bytes=0 (forbidden in DER).
+        let err = decode_length(&[0x80]).unwrap_err();
+        assert!(matches!(err, CredSspError::Asn1Decode(_)));
+    }
+
+    #[test]
+    fn decode_length_rejects_long_form_truncated() {
+        // 0x82 announces 2 bytes follow, but only 1 byte available.
+        let err = decode_length(&[0x82, 0x01]).unwrap_err();
+        assert!(matches!(err, CredSspError::Asn1Decode(_)));
+    }
+
+    #[test]
+    fn read_tlv_rejects_length_exceeding_data() {
+        // tag 0x04 (OCTET STRING), len=10, but only 2 bytes follow.
+        let err = read_tlv(&[0x04, 0x0a, 0x00, 0x00]).unwrap_err();
+        assert!(matches!(err, CredSspError::Asn1Decode(_)));
+    }
+
+    #[test]
+    fn decode_ts_request_returns_default_version_when_absent() {
+        // SEQUENCE with [1] nego_token only — version defaults to 2.
+        let octet = encode_octet_string(b"NTLM");
+        let inner = encode_sequence(&encode_context_tag(0, &octet));
+        let nego_data = encode_sequence(&inner);
+        let body = encode_context_tag(1, &nego_data);
+        let req = encode_sequence(&body);
+        let parsed = decode_ts_request(&req).unwrap();
+        assert_eq!(parsed.version, 2);
+        assert!(parsed.nego_token.is_some());
+    }
+
+    #[test]
     fn decode_ts_request_not_sequence() {
         // OCTET STRING instead of SEQUENCE
         let data = encode_octet_string(b"bad");
