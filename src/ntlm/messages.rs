@@ -99,16 +99,21 @@ pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
     let mut server_challenge = [0u8; 8];
     server_challenge.copy_from_slice(&data[24..32]);
 
-    // Target info security buffer at offset 40
+    // Target info security buffer at offset 40.
+    //
+    // ti_offset comes from a u32 cast to usize; on 32-bit targets the
+    // raw `ti_offset + ti_len` could wrap. checked_add keeps us honest
+    // regardless of pointer width.
     let (target_info, target_domain, timestamp) = if data.len() >= 48 {
         let ti_len = u16::from_le_bytes([data[40], data[41]]) as usize;
         let ti_offset = u32::from_le_bytes([data[44], data[45], data[46], data[47]]) as usize;
-        if ti_offset + ti_len <= data.len() {
-            let ti = data[ti_offset..ti_offset + ti_len].to_vec();
-            let (domain, ts) = parse_av_pairs(&ti);
-            (ti, domain, ts)
-        } else {
-            (Vec::new(), String::new(), None)
+        match ti_offset.checked_add(ti_len) {
+            Some(end) if end <= data.len() => {
+                let ti = data[ti_offset..end].to_vec();
+                let (domain, ts) = parse_av_pairs(&ti);
+                (ti, domain, ts)
+            }
+            _ => (Vec::new(), String::new(), None),
         }
     } else {
         (Vec::new(), String::new(), None)
