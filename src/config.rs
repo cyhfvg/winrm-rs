@@ -70,6 +70,15 @@ pub struct WinrmConfig {
     /// When set, the shell will be automatically closed by the server
     /// after this many seconds of inactivity.
     pub idle_timeout_secs: Option<u64>,
+    /// Maximum cumulative bytes accepted from the server for a single command's
+    /// stdout+stderr (default: `Some(64 * 1024 * 1024)` = 64 MiB).
+    ///
+    /// Prevents a malicious or runaway server from exhausting client memory
+    /// by streaming an unbounded base64 chunk sequence. When the cap is
+    /// reached, the operation returns [`crate::error::WinrmError::Transfer`]
+    /// and the shell is best-effort closed. Set to `None` to disable the
+    /// cap (pre-1.1 behaviour).
+    pub max_output_bytes: Option<usize>,
 }
 
 impl Default for WinrmConfig {
@@ -92,6 +101,7 @@ impl Default for WinrmConfig {
             working_directory: None,
             env_vars: Vec::new(),
             idle_timeout_secs: None,
+            max_output_bytes: Some(64 * 1024 * 1024),
         }
     }
 }

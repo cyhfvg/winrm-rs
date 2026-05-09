@@ -246,6 +246,7 @@ impl WinrmClient {
         let command_id = self.execute_command(host, shell_id, command, args).await?;
         debug!(command_id = %command_id, "WinRM command started");
 
+        let max_output = self.transport.config().max_output_bytes;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut exit_code: Option<i32> = None;
@@ -254,6 +255,15 @@ impl WinrmClient {
             let output = self.receive_output(host, shell_id, &command_id).await?;
             stdout.extend_from_slice(&output.stdout);
             stderr.extend_from_slice(&output.stderr);
+
+            if let Some(cap) = max_output
+                && stdout.len() + stderr.len() > cap
+            {
+                self.signal_terminate(host, shell_id, &command_id).await.ok();
+                return Err(WinrmError::Transfer(format!(
+                    "command output exceeded max_output_bytes ({cap})"
+                )));
+            }
 
             if output.exit_code.is_some() {
                 exit_code = output.exit_code;
@@ -366,6 +376,8 @@ impl WinrmClient {
         let (mut items, mut context) =
             soap::parse_enumerate_response(&response).map_err(WinrmError::Soap)?;
 
+        let max_output = config.max_output_bytes;
+
         // Phase 2: Pull remaining items if enumeration is not complete
         while let Some(ctx) = context {
             let pull_envelope = soap::pull_request(
@@ -382,6 +394,14 @@ impl WinrmClient {
                 soap::parse_enumerate_response(&pull_response).map_err(WinrmError::Soap)?;
             items.push_str(&more_items);
             context = next_ctx;
+
+            if let Some(cap) = max_output
+                && items.len() > cap
+            {
+                return Err(WinrmError::Transfer(format!(
+                    "WQL enumeration exceeded max_output_bytes ({cap})"
+                )));
+            }
         }
 
         Ok(items)

@@ -78,6 +78,7 @@ impl<'a> Shell<'a> {
         debug!(command_id = %command_id, "shell command started");
 
         let timeout_duration = Duration::from_secs(self.client.config().operation_timeout_secs * 2);
+        let max_output = self.client.config().max_output_bytes;
 
         let result = tokio::time::timeout(timeout_duration, async {
             let mut stdout = Vec::new();
@@ -91,6 +92,14 @@ impl<'a> Shell<'a> {
                     .await?;
                 stdout.extend_from_slice(&output.stdout);
                 stderr.extend_from_slice(&output.stderr);
+
+                if let Some(cap) = max_output
+                    && stdout.len() + stderr.len() > cap
+                {
+                    return Err(WinrmError::Transfer(format!(
+                        "command output exceeded max_output_bytes ({cap})"
+                    )));
+                }
 
                 exit_code = output.exit_code.or(exit_code);
 
