@@ -57,8 +57,20 @@ impl HttpTransport {
         config: WinrmConfig,
         credentials: WinrmCredentials,
     ) -> Result<Self, WinrmError> {
+        if config.accept_invalid_certs {
+            tracing::warn!(
+                "TLS certificate verification disabled (accept_invalid_certs=true) — \
+                 TEST USE ONLY, do not use in production"
+            );
+        }
+
+        // The WinRM endpoint is fixed by the caller (host:port/wsman); a
+        // server returning a 30x is unexpected and any cross-origin redirect
+        // would risk forwarding the Authorization header. Disable redirects
+        // entirely.
         let mut builder = reqwest::Client::builder()
             .danger_accept_invalid_certs(config.accept_invalid_certs)
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .timeout(Duration::from_secs(config.operation_timeout_secs + 10))
             .http1_only()
