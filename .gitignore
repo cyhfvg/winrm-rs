@@ -29,6 +29,9 @@ tarpaulin-report.html
 .claude/
 CLAUDE.md
 
+# Serena MCP project metadata
+.serena/
+
 # Network debug captures
 *.pcap
 *.pcapng

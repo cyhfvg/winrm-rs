@@ -280,15 +280,42 @@ struct CredSspConnection {
 impl CredSspConnection {
     /// Open a TCP+TLS connection to (host:port). The returned object owns
     /// the underlying socket; drop to close.
-    async fn connect(host: &str, port: u16, path: &str) -> Result<Self, WinrmError> {
+    ///
+    /// `accept_invalid_certs=true` disables outer TLS verification — TEST USE
+    /// ONLY. The inner CredSSP TLS is authenticated via pubKeyAuth (MS-CSSP
+    /// §3.1.5.1), independent of the outer chain.
+    async fn connect(
+        host: &str,
+        port: u16,
+        path: &str,
+        accept_invalid_certs: bool,
+    ) -> Result<Self, WinrmError> {
         use tokio::net::TcpStream;
         use tokio_rustls::TlsConnector;
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+            if accept_invalid_certs {
+                tracing::warn!(
+                    "CredSSP outer TLS verification disabled (accept_invalid_certs=true) \
+                     — credentials transit a MITM-vulnerable channel; do not use in production"
+                );
+                Arc::new(crate::tls::NoVerifier)
+            } else {
+                let root_store = rustls::RootCertStore::from_iter(
+                    webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+                );
+                rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+                    .build()
+                    .map_err(|e| {
+                        WinrmError::AuthFailed(format!("CredSSP TLS verifier build: {e}"))
+                    })?
+            };
+
         let mut outer_config = rustls::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
+            .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
         if std::env::var("SSLKEYLOGFILE").is_ok() {
             outer_config.key_log = Arc::new(rustls::KeyLogFile::new());
@@ -503,6 +530,10 @@ pub(crate) struct CredSspAuth {
     pub(crate) password: Zeroizing<String>,
     pub(crate) domain: String,
     pub(crate) cert_handle: Option<CertHandle>,
+    /// Mirrors `WinrmConfig.accept_invalid_certs`. When true, the outer TLS
+    /// channel skips chain validation. Inner TLS authentication relies on
+    /// pubKeyAuth regardless (MS-CSSP §3.1.5.1).
+    pub(crate) accept_invalid_certs: bool,
 }
 
 #[cfg(feature = "credssp")]
@@ -518,7 +549,8 @@ impl AuthTransport for CredSspAuth {
         // reqwest entirely and drive raw HTTP/1.1 over a single tokio_rustls
         // TlsStream. See CredSspConnection above.
         let (host, port, path) = parse_url(url)?;
-        let mut conn = CredSspConnection::connect(&host, port, &path).await?;
+        let mut conn =
+            CredSspConnection::connect(&host, port, &path, self.accept_invalid_certs).await?;
 
         // Pywinrm sends the SOAP body in every CredSSP round (which is what
         // Microsoft HTTPAPI on the WSMAN listener expects). The same body is

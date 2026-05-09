@@ -216,6 +216,7 @@ impl HttpTransport {
                     password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
                     domain: self.credentials.domain.clone(),
                     cert_handle: self.cert_handle.clone(),
+                    accept_invalid_certs: self.config.accept_invalid_certs,
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
             }
