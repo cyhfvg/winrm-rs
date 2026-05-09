@@ -306,23 +306,20 @@ impl CredSspConnection {
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-            if accept_invalid_certs {
-                tracing::warn!(
-                    "CredSSP outer TLS verification disabled (accept_invalid_certs=true) \
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = if accept_invalid_certs
+        {
+            tracing::warn!(
+                "CredSSP outer TLS verification disabled (accept_invalid_certs=true) \
                      — credentials transit a MITM-vulnerable channel; do not use in production"
-                );
-                Arc::new(crate::tls::NoVerifier)
-            } else {
-                let root_store = rustls::RootCertStore::from_iter(
-                    webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-                );
-                rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
-                    .build()
-                    .map_err(|e| {
-                        WinrmError::AuthFailed(format!("CredSSP TLS verifier build: {e}"))
-                    })?
-            };
+            );
+            Arc::new(crate::tls::NoVerifier)
+        } else {
+            let root_store =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+                .build()
+                .map_err(|e| WinrmError::AuthFailed(format!("CredSSP TLS verifier build: {e}")))?
+        };
 
         let mut outer_config = rustls::ClientConfig::builder()
             .dangerous()

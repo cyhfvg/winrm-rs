@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **CRITICAL** — CredSSP outer TLS now validates the server certificate
+  chain by default. Previously the outer HTTPS leg used a hardcoded
+  `NoVerifier`, making the channel that carries CredSSP TSRequests
+  vulnerable to MITM. The inner CredSSP TLS continues to use
+  `SslVerifyMode::NONE` because authentication is provided by
+  `pubKeyAuth` (MS-CSSP §3.1.5.1), which the client now also documents
+  inline. (`src/auth/credssp.rs`)
+- **HIGH** — Kerberos mutual authentication failures are now propagated.
+  Previously `ctx.step(server_token)` was assigned to `_`, so a forged
+  or missing server token silently passed. (`src/auth/kerberos.rs`)
+- **HIGH** — Basic auth credentials are now stored in `SecretString` and
+  built inside a `Zeroizing` buffer, ensuring the cleartext is wiped
+  from heap memory immediately after base64-encoding. (`src/auth/basic.rs`)
+- **HIGH** — NTLM CBT fallback (cert capture None while TLS active) now
+  emits a `tracing::warn` so operators can detect silent regression to
+  non-CBT auth. (`src/auth/ntlm.rs`)
+- **MEDIUM** — `WinrmConfig.max_output_bytes` (new field, default 64
+  MiB) caps cumulative stdout+stderr per command, preventing OOM via a
+  malicious server streaming an unbounded base64 chunk sequence. Set to
+  `None` to restore unbounded behaviour. (`src/config.rs`, `src/shell.rs`,
+  `src/client.rs`)
+- **MEDIUM** — NTLM unseal HMAC-MD5 comparison switched to
+  `subtle::ConstantTimeEq`. (`src/ntlm/mod.rs`)
+- **MEDIUM** — ASN.1 `decode_integer` rejects DER INTEGER payloads of
+  length 0 or > 4 bytes, preventing silent u32 overflow on hostile
+  TSRequests. (`src/asn1.rs`)
+- **MEDIUM** — Type 2 NTLM challenge `target_info` parse now uses
+  `checked_add` for offset+length bounds (32-bit safety).
+  (`src/ntlm/messages.rs`)
+- **MEDIUM** — HTTP redirects are no longer followed
+  (`Policy::none()`); a 30x from the WinRM endpoint surfaces as an
+  error rather than risking Authorization-header forwarding.
+  Construction also emits `tracing::warn` when
+  `accept_invalid_certs=true`. (`src/transport.rs`)
+- **MEDIUM** — `encode_ts_credentials` returns `Zeroizing<Vec<u8>>`;
+  intermediate plaintext credential buffers are wiped after CredSSP
+  seal. (`src/asn1.rs`)
+- **MEDIUM** — `endpoint()` sanitises the host argument (strips
+  scheme / userinfo / path / port; preserves IPv6 literals) and logs a
+  WARN when it had to clean anything. (`src/transport.rs`)
+- **LOW** — PSRP Create envelope now `xml_escape`s the ShellId
+  defensively. (`src/soap/envelope.rs`)
+- **LOW** — `CertCapturingVerifier` logs an error when the mutex is
+  poisoned, instead of silently dropping the captured cert.
+  (`src/tls.rs`)
+- **DEPS** — `cargo update -p rustls-webpki` (0.103.10 → 0.103.13)
+  closes RUSTSEC-2026-0098, -0099, -0104.
+
+### Added
+
+- New dev-test `tests/security_regression.rs` pins HTTP redirect
+  refusal as a public-API behaviour.
+- `subtle 2.6` dependency (already present transitively through
+  rustls/ring; promoted to a direct dep for the constant-time HMAC
+  compare).
+
+### Changed
+
+- `WinrmConfig.accept_invalid_certs` doc comment now includes a
+  `# Security` section explicitly stating the flag also disables CredSSP
+  outer-TLS verification.
+
 ## [1.0.0] - 2026-04-12
 
 ### Highlights

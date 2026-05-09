@@ -259,7 +259,9 @@ impl WinrmClient {
             if let Some(cap) = max_output
                 && stdout.len() + stderr.len() > cap
             {
-                self.signal_terminate(host, shell_id, &command_id).await.ok();
+                self.signal_terminate(host, shell_id, &command_id)
+                    .await
+                    .ok();
                 return Err(WinrmError::Transfer(format!(
                     "command output exceeded max_output_bytes ({cap})"
                 )));
