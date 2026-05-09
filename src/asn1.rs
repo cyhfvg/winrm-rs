@@ -269,11 +269,22 @@ fn decode_octet_string(data: &[u8]) -> Result<&[u8], CredSspError> {
 }
 
 /// Extract an INTEGER value from a TLV.
+///
+/// Restricts the encoded length to 1..=4 bytes so the accumulator never
+/// overflows `u32`. A hostile CredSSP server could otherwise send a 5-byte
+/// or larger DER INTEGER and silently wrap our result, leading to version
+/// or error-code confusion.
 fn decode_integer(data: &[u8]) -> Result<u32, CredSspError> {
     let (tag, val, _) = read_tlv(data)?;
     if tag != TAG_INTEGER {
         return Err(CredSspError::Asn1Decode(format!(
             "expected INTEGER (0x02), got 0x{tag:02x}"
+        )));
+    }
+    if val.is_empty() || val.len() > 4 {
+        return Err(CredSspError::Asn1Decode(format!(
+            "INTEGER length {} unsupported (expected 1..=4)",
+            val.len()
         )));
     }
     let mut result = 0u32;
@@ -560,6 +571,21 @@ mod tests {
     fn decode_integer_wrong_tag() {
         let data = encode_octet_string(b"nope");
         assert!(decode_integer(&data).is_err());
+    }
+
+    #[test]
+    fn decode_integer_rejects_oversized_payload() {
+        // 5-byte INTEGER would silently overflow our u32 accumulator.
+        let data = [TAG_INTEGER, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05];
+        let err = decode_integer(&data).unwrap_err();
+        assert!(matches!(err, CredSspError::Asn1Decode(_)));
+    }
+
+    #[test]
+    fn decode_integer_rejects_empty_payload() {
+        let data = [TAG_INTEGER, 0x00];
+        let err = decode_integer(&data).unwrap_err();
+        assert!(matches!(err, CredSspError::Asn1Decode(_)));
     }
 
     #[test]
