@@ -47,9 +47,17 @@ impl ServerCertVerifier for CertCapturingVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        // Capture the end-entity certificate (DER bytes)
-        if let Ok(mut captured) = self.captured_cert.lock() {
-            *captured = Some(end_entity.to_vec());
+        // Capture the end-entity certificate (DER bytes).
+        //
+        // Mutex poisoning is rare but possible if a previous handshake
+        // panicked mid-capture. Log loudly because losing the cert here
+        // means NTLM will fall back to non-CBT silently.
+        match self.captured_cert.lock() {
+            Ok(mut captured) => *captured = Some(end_entity.to_vec()),
+            Err(_) => tracing::error!(
+                "CertCapturingVerifier mutex poisoned — server cert not stored, \
+                 NTLM Channel Binding will be skipped"
+            ),
         }
         // Delegate actual verification to the inner verifier
         self.inner

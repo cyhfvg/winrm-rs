@@ -224,6 +224,17 @@ fn build_inner_openssl_tls() -> Result<OpenSslMemTls, WinrmError> {
 
     let mut builder = SslConnector::builder(SslMethod::tls_client())
         .map_err(|e| WinrmError::AuthFailed(format!("SslConnector: {e}")))?;
+    // SslVerifyMode::NONE is intentional and protocol-correct here.
+    //
+    // The CredSSP inner channel is authenticated by `pubKeyAuth`
+    // (MS-CSSP §3.1.5.1): the client computes a hash over the server's
+    // SubjectPublicKeyInfo + a nonce, the NTLM session seals it, and
+    // the server is expected to echo the symmetric counter-hash. The
+    // pubKeyAuth check is performed at line ~795 below; if it fails we
+    // abort with `CredSspError::PublicKeyMismatch`. So an X.509 chain
+    // check on this leg would be redundant — and crucially, the
+    // outer/transport leg already validates the chain (see
+    // CredSspConnection::connect / transport.rs CertCapturingVerifier).
     builder.set_verify(SslVerifyMode::NONE);
     // Force TLS 1.2 to match what Microsoft CredSSP server expects.
     builder

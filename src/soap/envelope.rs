@@ -199,11 +199,16 @@ pub(crate) fn create_psrp_shell_request(
     </wsman:OptionSet>
   </s:Header>"#,
     );
+    // Escape ShellId defensively. The crate generates ShellIds via
+    // uuid::Uuid::new_v4() so the value is currently always ASCII
+    // [0-9a-f-], but escaping costs nothing and survives future
+    // refactors that might let a caller-supplied id leak into here.
+    let escaped_shell_id = xml_escape(shell_id);
     format!(
         r#"<s:Envelope {NS_DECL_WITH_RSP}>
 {header_with_options}
   <s:Body>
-    <rsp:Shell ShellId="{shell_id}">
+    <rsp:Shell ShellId="{escaped_shell_id}">
       <rsp:InputStreams>stdin pr</rsp:InputStreams>
       <rsp:OutputStreams>stdout</rsp:OutputStreams>{idle_timeout}
       <creationXml xmlns="http://schemas.microsoft.com/powershell">{creation_xml_b64}</creationXml>

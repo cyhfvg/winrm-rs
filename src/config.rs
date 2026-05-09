@@ -15,7 +15,17 @@ pub struct WinrmConfig {
     pub port: u16,
     /// Whether to connect over HTTPS. When `true`, the endpoint URL uses `https://`.
     pub use_tls: bool,
-    /// Accept invalid or self-signed TLS certificates. **Use only in test environments.**
+    /// Accept invalid or self-signed TLS certificates.
+    ///
+    /// # Security
+    ///
+    /// Setting this to `true` disables chain verification on **both** the
+    /// regular HTTPS transport and the CredSSP outer TLS leg, leaving the
+    /// connection vulnerable to MITM. Credentials transmitted over Basic,
+    /// NTLM, or CredSSP can then be intercepted.
+    ///
+    /// Use **only** in test environments. The constructor logs a
+    /// `tracing::warn` when this flag is enabled.
     pub accept_invalid_certs: bool,
     /// TCP connect timeout in seconds (default: 30).
     pub connect_timeout_secs: u64,
