@@ -183,27 +183,52 @@ impl NtlmAuth {
             .unwrap_or(url);
         let target_name = format!("http/{host_part}");
 
-        let (type3, session_key) =
-            if let Some(cert_der) = self.cert_handle.as_ref().and_then(|h| h.get()) {
-                let cbt = crate::ntlm::crypto::compute_channel_bindings(&cert_der);
-                ntlm::create_authenticate_message_with_cbt_and_key(
-                    &challenge,
-                    &self.username,
-                    &self.password,
-                    &domain,
-                    cbt,
-                )
-            } else {
-                ntlm::create_authenticate_message_with_key_and_mic(
-                    &challenge,
-                    &self.username,
-                    &self.password,
-                    &domain,
-                    &type1,
-                    &type2_raw,
-                    &target_name,
-                )
-            };
+        // Channel Binding Tokens (CBT) bind the NTLM auth to the TLS channel
+        // and are the primary mitigation against NTLM-over-TLS relay attacks.
+        // We can only compute the CBT when the rustls verifier successfully
+        // captured the server cert (cert_handle is Some AND get() returns
+        // Some). If TLS is active but the capture failed (e.g. mutex poison,
+        // verifier swapped), we fall back to non-CBT NTLM — but log a WARN
+        // so operators can investigate.
+        let (type3, session_key) = match self.cert_handle.as_ref() {
+            Some(handle) => match handle.get() {
+                Some(cert_der) => {
+                    let cbt = crate::ntlm::crypto::compute_channel_bindings(&cert_der);
+                    ntlm::create_authenticate_message_with_cbt_and_key(
+                        &challenge,
+                        &self.username,
+                        &self.password,
+                        &domain,
+                        cbt,
+                    )
+                }
+                None => {
+                    tracing::warn!(
+                        "NTLM-over-TLS: server certificate capture returned None; \
+                         falling back to non-CBT authentication. This weakens \
+                         relay-attack protection — investigate verifier state."
+                    );
+                    ntlm::create_authenticate_message_with_key_and_mic(
+                        &challenge,
+                        &self.username,
+                        &self.password,
+                        &domain,
+                        &type1,
+                        &type2_raw,
+                        &target_name,
+                    )
+                }
+            },
+            None => ntlm::create_authenticate_message_with_key_and_mic(
+                &challenge,
+                &self.username,
+                &self.password,
+                &domain,
+                &type1,
+                &type2_raw,
+                &target_name,
+            ),
+        };
         let auth_header = ntlm::encode_authorization(&type3);
 
         // Apply NTLM sealing if requested (legacy path — doesn't work with WinRM
