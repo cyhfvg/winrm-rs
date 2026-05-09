@@ -48,16 +48,23 @@ impl AuthTransport for KerberosAuth {
             .await
             .map_err(WinrmError::Http)?;
 
-        // Handle mutual auth (server sends back a token)
+        // Handle mutual auth (server sends back a token).
+        //
+        // Verifying the server token is the GSS-API mutual-auth check: it
+        // proves the server holds the SPN's keytab. Silently ignoring a
+        // step() error would let an unauthenticated server pass.
         if let Some(www_auth) = resp
             .headers()
             .get("WWW-Authenticate")
             .and_then(|v| v.to_str().ok())
             && let Some(token_b64) = www_auth.strip_prefix("Negotiate ")
-            && let Ok(server_token) = B64.decode(token_b64.trim_ascii())
         {
-            // Complete the Kerberos handshake
-            let _ = ctx.step(&server_token);
+            let server_token = B64.decode(token_b64.trim_ascii()).map_err(|e| {
+                WinrmError::AuthFailed(format!("Kerberos: bad b64 in WWW-Authenticate: {e}"))
+            })?;
+            ctx.step(&server_token).map_err(|e| {
+                WinrmError::AuthFailed(format!("Kerberos mutual authentication failed: {e}"))
+            })?;
         }
 
         if resp.status().as_u16() == 401 {
