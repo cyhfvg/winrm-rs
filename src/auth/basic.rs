@@ -3,6 +3,8 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use secrecy::{ExposeSecret, SecretString};
+use zeroize::Zeroizing;
 
 use crate::auth::AuthTransport;
 use crate::error::WinrmError;
@@ -10,16 +12,22 @@ use crate::error::WinrmError;
 /// Basic authentication transport.
 ///
 /// Sends credentials as a base64-encoded `Authorization: Basic` header on
-/// every request. Only safe over HTTPS.
+/// every request. Only safe over HTTPS. The encoded credentials are kept
+/// in a [`SecretString`] so the buffer is zeroized on drop.
 pub(crate) struct BasicAuth {
-    pub(crate) credentials_b64: String,
+    pub(crate) credentials_b64: SecretString,
 }
 
 impl BasicAuth {
     /// Create a new `BasicAuth` from username and password.
     pub(crate) fn new(username: &str, password: &str) -> Self {
-        let credentials_b64 = B64.encode(format!("{username}:{password}"));
-        Self { credentials_b64 }
+        // Build "user:pass" inside a Zeroizing buffer so the cleartext
+        // never lingers after we've base64-encoded it.
+        let raw = Zeroizing::new(format!("{username}:{password}"));
+        let encoded = B64.encode(raw.as_bytes());
+        Self {
+            credentials_b64: SecretString::from(encoded),
+        }
     }
 }
 
@@ -33,7 +41,10 @@ impl AuthTransport for BasicAuth {
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
-            .header(AUTHORIZATION, format!("Basic {}", self.credentials_b64))
+            .header(
+                AUTHORIZATION,
+                format!("Basic {}", self.credentials_b64.expose_secret()),
+            )
             .body(body)
             .send()
             .await
@@ -66,7 +77,7 @@ mod tests {
     fn new_encodes_credentials_base64() {
         let auth = BasicAuth::new("admin", "p@ss");
         let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&auth.credentials_b64)
+            .decode(auth.credentials_b64.expose_secret())
             .unwrap();
         assert_eq!(decoded, b"admin:p@ss");
     }
