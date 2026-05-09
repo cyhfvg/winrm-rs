@@ -129,26 +129,36 @@ pub(crate) fn encode_ts_request(
 }
 
 /// Encode TSCredentials (MS-CSSP 2.2.1.2).
-pub(crate) fn encode_ts_credentials(domain: &str, username: &str, password: &str) -> Vec<u8> {
-    let domain_bytes = crate::ntlm::crypto::to_utf16le(domain);
-    let user_bytes = crate::ntlm::crypto::to_utf16le(username);
-    let pass_bytes = crate::ntlm::crypto::to_utf16le(password);
+///
+/// Returns a [`Zeroizing`] buffer so the cleartext-credentials DER blob is
+/// wiped from memory once the caller drops it (typically right after the
+/// blob is sealed by NTLM).
+pub(crate) fn encode_ts_credentials(
+    domain: &str,
+    username: &str,
+    password: &str,
+) -> zeroize::Zeroizing<Vec<u8>> {
+    use zeroize::Zeroizing;
+
+    let domain_bytes = Zeroizing::new(crate::ntlm::crypto::to_utf16le(domain));
+    let user_bytes = Zeroizing::new(crate::ntlm::crypto::to_utf16le(username));
+    let pass_bytes = Zeroizing::new(crate::ntlm::crypto::to_utf16le(password));
 
     // TSPasswordCreds
-    let mut pwd_contents = Vec::new();
+    let mut pwd_contents = Zeroizing::new(Vec::new());
     pwd_contents.extend_from_slice(&encode_context_tag(0, &encode_octet_string(&domain_bytes)));
     pwd_contents.extend_from_slice(&encode_context_tag(1, &encode_octet_string(&user_bytes)));
     pwd_contents.extend_from_slice(&encode_context_tag(2, &encode_octet_string(&pass_bytes)));
-    let ts_password_creds = encode_sequence(&pwd_contents);
+    let ts_password_creds = Zeroizing::new(encode_sequence(&pwd_contents));
 
     // TSCredentials { credType: 1, credentials: DER(TSPasswordCreds) }
-    let mut cred_contents = Vec::new();
+    let mut cred_contents = Zeroizing::new(Vec::new());
     cred_contents.extend_from_slice(&encode_context_tag(0, &encode_integer_value(1)));
     cred_contents.extend_from_slice(&encode_context_tag(
         1,
         &encode_octet_string(&ts_password_creds),
     ));
-    encode_sequence(&cred_contents)
+    Zeroizing::new(encode_sequence(&cred_contents))
 }
 
 /// Wrap an NTLM Type 1 message in SPNEGO NegTokenInit (RFC 4178).
