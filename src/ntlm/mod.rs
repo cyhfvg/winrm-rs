@@ -202,12 +202,17 @@ impl NtlmSession {
         sig_checksum.copy_from_slice(&signature[4..12]);
         self.server_seal_handle.process(&mut sig_checksum);
 
-        // Verify HMAC-MD5 checksum against decrypted plaintext
+        // Verify HMAC-MD5 checksum against decrypted plaintext.
+        //
+        // Use a constant-time comparison so the time taken to detect a
+        // mismatch does not leak how many leading bytes of the checksum
+        // are correct. Defence-in-depth against timing oracles.
+        use subtle::ConstantTimeEq;
         let mut expected_sig_input = Vec::with_capacity(4 + plaintext.len());
         expected_sig_input.extend_from_slice(&self.server_seq_num.to_le_bytes());
         expected_sig_input.extend_from_slice(&plaintext);
         let expected_checksum = hmac_md5(&self.server_sign_key, &expected_sig_input);
-        if sig_checksum != expected_checksum[..8] {
+        if sig_checksum.ct_eq(&expected_checksum[..8]).unwrap_u8() == 0 {
             return Err(NtlmError::InvalidMessage("checksum mismatch".into()));
         }
 
