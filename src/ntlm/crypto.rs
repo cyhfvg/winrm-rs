@@ -11,6 +11,7 @@
 use hmac::{Hmac, KeyInit, Mac};
 use md4::{Digest, Md4};
 use md5::Md5;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub(crate) type HmacMd5 = Hmac<Md5>;
 
@@ -81,8 +82,8 @@ pub(crate) fn compute_nt_hash(password: &str) -> [u8; 16] {
 
 /// NTLMv2 Hash = HMAC-MD5(NT_Hash, UTF-16LE(UPPER(username) + domain)) (MS-NLMP 3.3.2, NTOWFv2).
 pub(crate) fn compute_ntlmv2_hash(nt_hash: &[u8; 16], username: &str, domain: &str) -> [u8; 16] {
-    let identity = format!("{}{}", username.to_uppercase(), domain);
-    let identity_bytes = to_utf16le(&identity);
+    let identity = Zeroizing::new(format!("{}{}", username.to_uppercase(), domain));
+    let identity_bytes = Zeroizing::new(to_utf16le(&identity));
     hmac_md5(nt_hash, &identity_bytes)
 }
 
@@ -221,6 +222,12 @@ pub(crate) fn compute_channel_bindings(cert_der: &[u8]) -> [u8; 16] {
 ///
 /// Minimal inline implementation per the RC4 algorithm. Used by [`super::NtlmSession`]
 /// for encrypting/decrypting NTLM message signatures and payloads.
+///
+/// The S-box (256 B) is derived from a sealing key and so is itself secret —
+/// `Zeroize` + `ZeroizeOnDrop` ensure the bytes are wiped when the session
+/// drops, even after caller-side spills (compiler-confirmed at -O2 the
+/// previous version retained S-box bytes through callee-saved registers).
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub(crate) struct Rc4State {
     s: [u8; 256],
     i: u8,

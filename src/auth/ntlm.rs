@@ -110,7 +110,7 @@ impl NtlmAuth {
         http: &reqwest::Client,
         url: &str,
         body: &str,
-    ) -> Result<(String, [u8; 16]), WinrmError> {
+    ) -> Result<(String, Zeroizing<[u8; 16]>), WinrmError> {
         let (response, session_key) = self.do_handshake(http, url, body, false).await?;
         Ok((response, session_key))
     }
@@ -125,7 +125,7 @@ impl NtlmAuth {
         url: &str,
         body: &str,
         seal: bool,
-    ) -> Result<(String, [u8; 16]), WinrmError> {
+    ) -> Result<(String, Zeroizing<[u8; 16]>), WinrmError> {
         // Step 1: Send Type 1 (Negotiate) with empty body
         let type1 = ntlm::create_negotiate_message();
         let auth_header = ntlm::encode_authorization(&type1);

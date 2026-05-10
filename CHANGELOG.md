@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **CRITICAL** — Three NTLM/CredSSP RNG-override env-var test backdoors
+  (`CREDSSP_FIXED_CC`, `CREDSSP_FIXED_RSK`, `CREDSSP_FIXED_NONCE`) are
+  now gated behind `cfg(debug_assertions)`. Release binaries always use
+  the CSPRNG, so a hostile environment can no longer collapse the NTLMv2
+  client challenge, the random session key, or the CredSSP-v6 pubKeyAuth
+  nonce to deterministic values. (`src/ntlm/messages.rs`,
+  `src/auth/credssp.rs`)
+- **CRITICAL** — Three secret-dumping env-var debug backdoors
+  (`CREDSSP_DEBUG`, `CREDSSP_DUMP`, `SSLKEYLOGFILE`) are now gated
+  behind `cfg(debug_assertions)`. Release binaries strip the
+  `eprintln!` / `KeyLogFile` paths entirely, so support tickets and
+  rogue env vars can no longer exfiltrate `nt_proof_str`,
+  `session_base_key`, `exported_session_key`, MIC, or the outer-TLS
+  master secret. (`src/ntlm/messages.rs`, `src/auth/credssp.rs`)
+- **CRITICAL** — `NtlmSession` and `Rc4State` now derive
+  `Zeroize + ZeroizeOnDrop`. Sealing/signing keys and the 256-byte RC4
+  S-box are wiped from memory when the session drops, closing the
+  compiler-confirmed gap (5 OPTIMIZED_AWAY_ZEROIZE / 1 STACK_RETENTION /
+  9 REGISTER_SPILL findings at -O2). (`src/ntlm/mod.rs`,
+  `src/ntlm/crypto.rs`)
+- **HIGH** — `create_authenticate_message_*` now return
+  `Zeroizing<[u8; 16]>` for the exported session key, so the caller's
+  stack slot is wiped on drop instead of surviving compiler
+  optimisation. Wire bytes unchanged; only the Rust return type
+  changes. (`src/ntlm/messages.rs`, `src/auth/ntlm.rs`,
+  `src/auth/credssp.rs`)
+- **MEDIUM** — `compute_ntlmv2_hash` wraps the `format!`-built identity
+  string and its UTF-16-LE encoding in `Zeroizing`, removing two
+  un-zeroed heap allocations of (uppercase) username + domain.
+  (`src/ntlm/crypto.rs`)
+- **MEDIUM** — Type-3 `target_info` clone is now `Zeroizing<Vec<u8>>`;
+  the buffer feeds into the NTLMv2 transcript HMAC and so is part of
+  the cryptographic state. (`src/ntlm/messages.rs`)
+- **LOW** — Unconditional `eprintln!` of the negotiated CredSSP
+  version replaced with `tracing::debug!`. (`src/auth/credssp.rs`)
+- **LOW** — `parse_receive_response` now emits `tracing::warn` when
+  the server returns an `<ExitCode>` element with unparseable text,
+  surfacing a previously silent fail-soft branch that callers gating
+  on exit code could not distinguish from "command still running".
+  (`src/soap/parser.rs`)
 - **CRITICAL** — CredSSP outer TLS now validates the server certificate
   chain by default. Previously the outer HTTPS leg used a hardcoded
   `NoVerifier`, making the channel that carries CredSSP TSRequests
@@ -61,9 +101,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - New dev-test `tests/security_regression.rs` pins HTTP redirect
   refusal as a public-API behaviour.
+- New dev-test `tests/proptest_wire_format.rs` (gated on the
+  `__internal` feature) anchors NTLM signature, base64 PowerShell
+  encoding, and SOAP-fault detector invariants with `proptest`.
 - `subtle 2.6` dependency (already present transitively through
   rustls/ring; promoted to a direct dep for the constant-time HMAC
   compare).
+- `proptest 1` dev-dependency.
+- `zeroize` direct dep now uses the `derive` feature for
+  `#[derive(ZeroizeOnDrop)]` on `NtlmSession` and `Rc4State`.
 
 ### Changed
 

@@ -51,7 +51,7 @@ hmac = "0.13"
 rand = "0.10"
 secrecy = { version = "0.10", features = ["serde"] }
 tracing = "0.1"
-zeroize = "1.8"
+zeroize = { version = "1.8", features = ["derive"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 rustls = { version = "0.23", features = ["ring"] }
 sha2 = "0.11"
@@ -84,3 +84,4 @@ wiremock = "0.6"
 serde_json = "1"
 tracing-test = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proptest = "1"

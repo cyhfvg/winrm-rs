@@ -26,6 +26,7 @@ pub use messages::{create_authenticate_message_credssp, create_negotiate_message
 // NtlmSession uses crypto internals
 use crate::error::NtlmError;
 use crypto::{Rc4State, hmac_md5};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// NTLM session state for message encryption/decryption after authentication.
 ///
@@ -47,6 +48,15 @@ use crypto::{Rc4State, hmac_md5};
 ///
 /// The actual integration into the HTTP transport (MIME multipart framing for
 /// encrypted payloads) is deferred to a future release.
+///
+/// # Memory hygiene
+///
+/// All four derived session keys plus the two RC4 S-boxes are wiped from
+/// memory when the session drops, via `ZeroizeOnDrop`. This is defence in
+/// depth — once `from_auth` runs, the long-lived session is the only place
+/// the sealing/signing key material lives, and its `Drop` ensures it does
+/// not survive the session in the process heap.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct NtlmSession {
     client_sign_key: [u8; 16],
     #[allow(dead_code)] // Used for full checksum verification (future)

@@ -79,9 +79,22 @@ pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
         done = true;
     }
 
-    // Extract ExitCode if present
+    // Extract ExitCode if present. A non-numeric ExitCode value from the
+    // server is left as `None` (fail-soft), but a `tracing::warn` is emitted
+    // so callers can distinguish "command still running" (no ExitCode element)
+    // from "server returned ExitCode element with unparseable text" (possible
+    // server malfunction or MITM tampering with the response).
     if let Some(code_str) = extract_element_text(xml, "ExitCode") {
-        exit_code = code_str.parse().ok();
+        match code_str.parse::<i32>() {
+            Ok(c) => exit_code = Some(c),
+            Err(e) => {
+                tracing::warn!(
+                    raw = %code_str.escape_debug(),
+                    error = %e,
+                    "WinRM ExitCode element present but unparseable; treating as absent",
+                );
+            }
+        }
     }
 
     // Check for SOAP faults

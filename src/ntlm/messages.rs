@@ -4,6 +4,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use zeroize::Zeroizing;
 
 use super::crypto::*;
 use crate::error::NtlmError;
@@ -129,6 +130,10 @@ pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
 }
 
 /// Internal implementation -- returns both the Type 3 message and the exported session key.
+///
+/// The session key is wrapped in `Zeroizing` so it is wiped from the caller's
+/// stack when dropped — closes the gap that compiler optimisation otherwise
+/// leaves at -O2 (no automatic wipe for plain `[u8; 16]` returns).
 fn create_authenticate_message_internal(
     challenge: &ChallengeMessage,
     username: &str,
@@ -137,7 +142,7 @@ fn create_authenticate_message_internal(
     channel_bindings: Option<[u8; 16]>,
     mic_input: Option<(&[u8], &[u8])>,
     target_name: Option<&str>,
-) -> (Vec<u8>, [u8; 16]) {
+) -> (Vec<u8>, Zeroizing<[u8; 16]>) {
     // Use the server's negotiated flags (from Type 2) for the Type 3 response,
     // augmented with KEY_EXCH and VERSION to enable message sealing.
     let flags = challenge.negotiate_flags | NEGOTIATE_KEY_EXCH | NEGOTIATE_VERSION;
@@ -173,28 +178,38 @@ pub(crate) fn create_authenticate_message_full(
     mic_input: Option<(&[u8], &[u8])>,
     target_name: Option<&str>,
     display_domain: Option<&str>,
-) -> (Vec<u8>, [u8; 16]) {
+) -> (Vec<u8>, Zeroizing<[u8; 16]>) {
     let nt_hash = compute_nt_hash(password);
     let ntlmv2_hash = compute_ntlmv2_hash(&nt_hash, username, domain);
 
-    let client_challenge: [u8; 8] = std::env::var("CREDSSP_FIXED_CC")
-        .ok()
-        .and_then(|s| {
+    // CREDSSP_FIXED_CC is a deterministic-test backdoor — only honoured in
+    // debug builds. Production binaries always use the CSPRNG.
+    let client_challenge: [u8; 8] = {
+        #[cfg(debug_assertions)]
+        let from_env = std::env::var("CREDSSP_FIXED_CC").ok().and_then(|s| {
             let bytes = (0..s.len())
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
                 .collect::<Option<Vec<_>>>()?;
             bytes.try_into().ok()
-        })
-        .unwrap_or_else(rand::random);
+        });
+        #[cfg(not(debug_assertions))]
+        let from_env: Option<[u8; 8]> = None;
+        from_env.unwrap_or_else(rand::random)
+    };
     let timestamp = challenge.timestamp.unwrap_or_else(current_windows_filetime);
 
     // Build target_info: start from server's, optionally inject CBT,
     // TARGET_NAME and AV_FLAGS, end with AV_EOL.
-    let mut target_info = challenge.target_info.clone();
+    //
+    // Wrapped in `Zeroizing` because the bytes (server-supplied, plus the
+    // CBT and SPN we append) feed straight into the HMAC over the NTLMv2
+    // blob and so are part of the cryptographic transcript.
+    let mut target_info = Zeroizing::new(challenge.target_info.clone());
     // Strip trailing AV_EOL (4 bytes) so we can append more AV_PAIRs
     if target_info.len() >= 4 {
-        target_info.truncate(target_info.len() - 4);
+        let new_len = target_info.len() - 4;
+        target_info.truncate(new_len);
     }
 
     if let Some(cb) = channel_bindings {
@@ -237,16 +252,21 @@ pub(crate) fn create_authenticate_message_full(
     // If NEGOTIATE_KEY_EXCH: generate random ExportedSessionKey, encrypt with RC4
     // Otherwise: ExportedSessionKey = KeyExchangeKey
     let (exported_session_key, encrypted_random_session_key) = if with_key_exch {
-        let random_key: [u8; 16] = std::env::var("CREDSSP_FIXED_RSK")
-            .ok()
-            .and_then(|s| {
+        // CREDSSP_FIXED_RSK is a deterministic-test backdoor — only honoured
+        // in debug builds. Production binaries always use the CSPRNG.
+        let random_key: [u8; 16] = {
+            #[cfg(debug_assertions)]
+            let from_env = std::env::var("CREDSSP_FIXED_RSK").ok().and_then(|s| {
                 let bytes = (0..s.len())
                     .step_by(2)
                     .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
                     .collect::<Option<Vec<_>>>()?;
                 bytes.try_into().ok()
-            })
-            .unwrap_or_else(rand::random);
+            });
+            #[cfg(not(debug_assertions))]
+            let from_env: Option<[u8; 16]> = None;
+            from_env.unwrap_or_else(rand::random)
+        };
         let mut encrypted = random_key;
         let mut rc4 = Rc4State::new(&key_exchange_key);
         rc4.process(&mut encrypted);
@@ -364,6 +384,10 @@ pub(crate) fn create_authenticate_message_full(
         let mic = hmac_md5(&exported_session_key, &input);
         msg[mic_pos..mic_pos + 16].copy_from_slice(&mic);
 
+        // CREDSSP_DEBUG dumps every secret in the handshake to stderr —
+        // strictly a debug-build aid. Compiled out of release binaries
+        // entirely so a hostile env var cannot enable it in production.
+        #[cfg(debug_assertions)]
         if std::env::var("CREDSSP_DEBUG").is_ok() {
             eprintln!("[CREDSSP_DEBUG] type1 ({}B): {}", type1.len(), hex(type1));
             eprintln!("[CREDSSP_DEBUG] type2 ({}B): {}", type2.len(), hex(type2));
@@ -390,9 +414,11 @@ pub(crate) fn create_authenticate_message_full(
         }
     }
 
-    (msg, exported_session_key)
+    (msg, Zeroizing::new(exported_session_key))
 }
 
+// Only used inside the CREDSSP_DEBUG block, which is debug-only.
+#[cfg(debug_assertions)]
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
@@ -426,7 +452,7 @@ pub(crate) fn create_authenticate_message_with_cbt_and_key(
     password: &str,
     domain: &str,
     channel_bindings: [u8; 16],
-) -> (Vec<u8>, [u8; 16]) {
+) -> (Vec<u8>, Zeroizing<[u8; 16]>) {
     create_authenticate_message_internal(
         challenge,
         username,
@@ -450,7 +476,7 @@ pub(crate) fn create_authenticate_message_with_key_and_mic(
     type1: &[u8],
     type2: &[u8],
     target_name: &str,
-) -> (Vec<u8>, [u8; 16]) {
+) -> (Vec<u8>, Zeroizing<[u8; 16]>) {
     create_authenticate_message_internal(
         challenge,
         username,
@@ -480,7 +506,7 @@ pub fn create_authenticate_message_credssp(
     spn: &str,
     type1_bytes: &[u8],
     type2_bytes: &[u8],
-) -> (Vec<u8>, [u8; 16]) {
+) -> (Vec<u8>, Zeroizing<[u8; 16]>) {
     let flags = challenge.negotiate_flags
         | NEGOTIATE_KEY_EXCH
         | NEGOTIATE_SEAL
@@ -783,7 +809,7 @@ mod tests {
         assert_eq!(u32::from_le_bytes(msg[8..12].try_into().unwrap()), 3);
         assert!(msg.len() > 64);
 
-        assert_ne!(session_key, [0u8; 16]);
+        assert_ne!(*session_key, [0u8; 16]);
     }
 
     #[test]
@@ -803,8 +829,8 @@ mod tests {
             &challenge, "admin", "pass", "DOM", None, None, None,
         );
 
-        assert_ne!(key1, [0u8; 16]);
-        assert_ne!(key2, [0u8; 16]);
+        assert_ne!(*key1, [0u8; 16]);
+        assert_ne!(*key2, [0u8; 16]);
     }
 
     #[test]
@@ -854,8 +880,8 @@ mod tests {
         assert_eq!(sk_len, 16);
         assert_eq!(msg.len(), sk_offset + sk_len);
 
-        assert_ne!(key, [0u8; 16]);
-        assert_ne!(key, [1u8; 16]);
+        assert_ne!(*key, [0u8; 16]);
+        assert_ne!(*key, [1u8; 16]);
     }
 
     #[test]
@@ -1149,7 +1175,7 @@ mod tests {
         assert_eq!(&msg[0..8], b"NTLMSSP\0");
         assert_eq!(u32::from_le_bytes(msg[8..12].try_into().unwrap()), 3);
         assert!(msg.len() > 64);
-        assert_ne!(key, [0u8; 16]);
+        assert_ne!(*key, [0u8; 16]);
     }
 
     // Kills create_negotiate_message_credssp returning vec![] / vec![0] / vec![1]

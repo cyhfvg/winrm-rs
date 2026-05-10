@@ -321,10 +321,23 @@ impl CredSspConnection {
                 .map_err(|e| WinrmError::AuthFailed(format!("CredSSP TLS verifier build: {e}")))?
         };
 
+        // The `mut` is only needed when we honour SSLKEYLOGFILE — that is in
+        // debug builds. In release the binding is immutable so rustc doesn't
+        // emit an "unused mut" warning.
+        #[cfg(debug_assertions)]
         let mut outer_config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
+        #[cfg(not(debug_assertions))]
+        let outer_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        // Honour SSLKEYLOGFILE only in debug builds. In release this env var
+        // is ignored so a hostile environment cannot enable wireshark-style
+        // session-key export of the outer CredSSP TLS leg.
+        #[cfg(debug_assertions)]
         if std::env::var("SSLKEYLOGFILE").is_ok() {
             outer_config.key_log = Arc::new(rustls::KeyLogFile::new());
         }
@@ -675,9 +688,10 @@ impl AuthTransport for CredSspAuth {
         // === Step 5: Decode TSRequest containing NTLM Type 2 ===
         let ts_resp = asn1::decode_ts_request(&plaintext).map_err(WinrmError::CredSsp)?;
         let negotiated_version = std::cmp::min(ts_resp.version, CREDSSP_VERSION);
-        eprintln!(
-            "[CREDSSP] server CredSSP version: {} (negotiated: {})",
-            ts_resp.version, negotiated_version
+        tracing::debug!(
+            server_version = ts_resp.version,
+            negotiated = negotiated_version,
+            "CredSSP version negotiation"
         );
         if let Some(code) = ts_resp.error_code {
             return Err(WinrmError::CredSsp(CredSspError::ServerError(code)));
@@ -717,17 +731,25 @@ impl AuthTransport for CredSspAuth {
         // returns STATUS_LOGON_FAILURE.
         let mech_list_mic = ntlm_session.sign(asn1::MECH_TYPE_LIST_NTLM);
 
-        // Compute pubKeyAuth (v6): SHA256(magic + nonce + SubjectPublicKey)
-        let nonce: [u8; 32] = std::env::var("CREDSSP_FIXED_NONCE")
-            .ok()
-            .and_then(|s| {
+        // Compute pubKeyAuth (v6): SHA256(magic + nonce + SubjectPublicKey).
+        //
+        // CREDSSP_FIXED_NONCE is a deterministic-test backdoor — only honoured
+        // in debug builds. Production binaries always use the CSPRNG so a
+        // hostile environment cannot collapse the v6 nonce defence against
+        // cross-protocol relay.
+        let nonce: [u8; 32] = {
+            #[cfg(debug_assertions)]
+            let from_env = std::env::var("CREDSSP_FIXED_NONCE").ok().and_then(|s| {
                 let bytes = (0..s.len())
                     .step_by(2)
                     .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
                     .collect::<Option<Vec<_>>>()?;
                 bytes.try_into().ok()
-            })
-            .unwrap_or_else(rand::random);
+            });
+            #[cfg(not(debug_assertions))]
+            let from_env: Option<[u8; 32]> = None;
+            from_env.unwrap_or_else(rand::random)
+        };
         let client_hash = {
             let mut hasher = Sha256::new();
             hasher.update(b"CredSSP Client-To-Server Binding Hash\0");
@@ -745,6 +767,10 @@ impl AuthTransport for CredSspAuth {
             None,
             Some(&nonce),
         );
+        // CREDSSP_DUMP dumps every secret (nonce, public key bind, sealed
+        // pubKeyAuth) to stderr — strictly a debug-build aid. Compiled out
+        // of release binaries entirely.
+        #[cfg(debug_assertions)]
         if std::env::var("CREDSSP_DUMP").is_ok() {
             let h = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
             eprintln!(
