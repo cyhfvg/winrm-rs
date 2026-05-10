@@ -315,6 +315,14 @@ impl WinrmClient {
         args: &[&str],
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<CommandOutput, WinrmError> {
+        // Honour a pre-cancelled token deterministically. Without this
+        // short-circuit `tokio::select!` polls the two arms in
+        // pseudo-random order, so on macOS the inner `run_command` future
+        // can start an HTTP request and surface a transport error
+        // *before* the cancel-arm is polled.
+        if cancel.is_cancelled() {
+            return Err(WinrmError::Cancelled);
+        }
         tokio::select! {
             result = self.run_command(host, command, args) => result,
             () = cancel.cancelled() => Err(WinrmError::Cancelled),

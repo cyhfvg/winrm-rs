@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-05-10
+
+### Fixed
+
+- **macOS test flake** — `run_command_with_cancel` /
+  `run_powershell_with_cancel` on both `WinrmClient` and `Shell` now
+  short-circuit with `WinrmError::Cancelled` when entered with a
+  pre-cancelled token. Previously the `tokio::select!` arm order was
+  non-deterministic across platforms; on macOS the inner request
+  future could surface a transport error before the cancel arm ran.
+  Wire semantics unchanged. (`src/client.rs`, `src/shell.rs`)
+
 ## [1.1.1] - 2026-05-10
 
 ### Security

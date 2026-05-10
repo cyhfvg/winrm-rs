@@ -141,6 +141,11 @@ impl<'a> Shell<'a> {
         args: &[&str],
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<CommandOutput, WinrmError> {
+        // Honour a pre-cancelled token deterministically; see the
+        // equivalent fix on `WinrmClient::run_command_with_cancel`.
+        if cancel.is_cancelled() {
+            return Err(WinrmError::Cancelled);
+        }
         tokio::select! {
             result = self.run_command(command, args) => result,
             () = cancel.cancelled() => {
