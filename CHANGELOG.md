@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-05-10
+
 ### Security
 
 - **CRITICAL** — Three NTLM/CredSSP RNG-override env-var test backdoors
