@@ -23,15 +23,27 @@ fn xml_escape(s: &str) -> String {
 }
 
 /// XML namespace declarations used in envelopes that include the shell namespace.
+///
+/// Includes Microsoft `wsmv` (SessionId/DataLocale) and dual `a`/`wsa`
+/// addressing prefixes to match pypsrp request shape.
 const NS_DECL_WITH_RSP: &str = r#"xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+  xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"
   xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
   xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
+  xmlns:wsmv="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd"
   xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell""#;
 
 /// XML namespace declarations without the shell namespace (used by Delete).
 const NS_DECL_NO_RSP: &str = r#"xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+  xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"
   xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
-  xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd""#;
+  xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
+  xmlns:wsmv="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd""#;
+
+/// Format a UUID as hyphenated uppercase (pypsrp / Windows client style).
+fn uuid_upper(id: Uuid) -> String {
+    id.hyphenated().to_string().to_uppercase()
+}
 
 /// Build the common SOAP envelope header.
 ///
@@ -43,6 +55,7 @@ fn build_header(
     shell_id: Option<&str>,
     timeout_secs: u64,
     max_envelope_size: u32,
+    session_id: Uuid,
 ) -> String {
     build_header_for(
         endpoint,
@@ -51,6 +64,7 @@ fn build_header(
         shell_id,
         timeout_secs,
         max_envelope_size,
+        session_id,
     )
 }
 
@@ -61,8 +75,11 @@ fn build_header_for(
     shell_id: Option<&str>,
     timeout_secs: u64,
     max_envelope_size: u32,
+    session_id: Uuid,
 ) -> String {
-    let message_id = Uuid::new_v4();
+    // MessageID is unique per request; SessionId is session-stable.
+    let message_id = uuid_upper(Uuid::new_v4());
+    let session_id_upper = uuid_upper(session_id);
     let selector = if let Some(sid) = shell_id {
         let escaped_sid = xml_escape(sid);
         format!(
@@ -75,18 +92,23 @@ fn build_header_for(
         String::new()
     };
     let escaped_endpoint = xml_escape(endpoint);
+    // Element order aligned with pypsrp (proven to avoid ~2s/POST stalls):
+    // Action → DataLocale → Locale → MaxEnvelopeSize → MessageID →
+    // OperationTimeout → ReplyTo → ResourceURI → SessionId → To [→ SelectorSet]
     format!(
         r#"  <s:Header>
-    <wsa:To>{escaped_endpoint}</wsa:To>
-    <wsman:ResourceURI s:mustUnderstand="true">{resource_uri}</wsman:ResourceURI>
+    <wsa:Action s:mustUnderstand="true">{action}</wsa:Action>
+    <wsmv:DataLocale s:mustUnderstand="false" xml:lang="en-US"/>
+    <wsman:Locale s:mustUnderstand="false" xml:lang="en-US"/>
+    <wsman:MaxEnvelopeSize s:mustUnderstand="true">{max_envelope_size}</wsman:MaxEnvelopeSize>
+    <wsa:MessageID>uuid:{message_id}</wsa:MessageID>
+    <wsman:OperationTimeout>PT{timeout_secs}S</wsman:OperationTimeout>
     <wsa:ReplyTo>
       <wsa:Address s:mustUnderstand="true">{REPLY_TO_ANONYMOUS}</wsa:Address>
     </wsa:ReplyTo>
-    <wsa:Action s:mustUnderstand="true">{action}</wsa:Action>
-    <wsman:MaxEnvelopeSize s:mustUnderstand="true">{max_envelope_size}</wsman:MaxEnvelopeSize>
-    <wsa:MessageID>uuid:{message_id}</wsa:MessageID>
-    <wsman:Locale xml:lang="en-US" s:mustUnderstand="false"/>
-    <wsman:OperationTimeout>PT{timeout_secs}S</wsman:OperationTimeout>{selector}
+    <wsman:ResourceURI s:mustUnderstand="true">{resource_uri}</wsman:ResourceURI>
+    <wsmv:SessionId s:mustUnderstand="false">uuid:{session_id_upper}</wsmv:SessionId>
+    <wsa:To>{escaped_endpoint}</wsa:To>{selector}
   </s:Header>"#
     )
 }
@@ -107,6 +129,7 @@ pub(crate) fn create_shell_request(endpoint: &str, config: &crate::config::Winrm
         None,
         config.operation_timeout_secs,
         config.max_envelope_size,
+        config.session_id,
     );
 
     let codepage = config.codepage;
@@ -184,6 +207,7 @@ pub(crate) fn create_psrp_shell_request(
         None,
         config.operation_timeout_secs,
         config.max_envelope_size,
+        config.session_id,
     );
     let idle_timeout = config
         .idle_timeout_secs
@@ -232,6 +256,7 @@ pub(crate) fn execute_command_with_id_request(
     timeout_secs: u64,
     max_envelope_size: u32,
     resource_uri: &str,
+    session_id: Uuid,
 ) -> String {
     let header = build_header_for(
         endpoint,
@@ -240,6 +265,7 @@ pub(crate) fn execute_command_with_id_request(
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     let mut args_xml = String::new();
     for a in args {
@@ -271,6 +297,7 @@ pub(crate) fn receive_psrp_request(
     timeout_secs: u64,
     max_envelope_size: u32,
     resource_uri: &str,
+    session_id: Uuid,
 ) -> String {
     let header = build_header_for(
         endpoint,
@@ -279,6 +306,7 @@ pub(crate) fn receive_psrp_request(
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     let stream = match command_id {
         Some(cid) => format!(
@@ -320,6 +348,7 @@ pub(crate) fn execute_command_request(
     args: &[&str],
     timeout_secs: u64,
     max_envelope_size: u32,
+    session_id: Uuid,
 ) -> String {
     execute_command_request_with_uri(
         endpoint,
@@ -329,6 +358,7 @@ pub(crate) fn execute_command_request(
         timeout_secs,
         max_envelope_size,
         RESOURCE_URI_CMD,
+        session_id,
     )
 }
 
@@ -340,6 +370,7 @@ pub(crate) fn execute_command_request_with_uri(
     timeout_secs: u64,
     max_envelope_size: u32,
     resource_uri: &str,
+    session_id: Uuid,
 ) -> String {
     let header = build_header_for(
         endpoint,
@@ -348,6 +379,7 @@ pub(crate) fn execute_command_request_with_uri(
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     let mut args_xml = String::new();
     for (i, a) in args.iter().enumerate() {
@@ -385,6 +417,7 @@ pub(crate) fn receive_output_request(
     command_id: &str,
     timeout_secs: u64,
     max_envelope_size: u32,
+    session_id: Uuid,
 ) -> String {
     receive_output_request_with_uri(
         endpoint,
@@ -393,6 +426,7 @@ pub(crate) fn receive_output_request(
         timeout_secs,
         max_envelope_size,
         RESOURCE_URI_CMD,
+        session_id,
     )
 }
 
@@ -403,6 +437,7 @@ pub(crate) fn receive_output_request_with_uri(
     timeout_secs: u64,
     max_envelope_size: u32,
     resource_uri: &str,
+    session_id: Uuid,
 ) -> String {
     let header = build_header_for(
         endpoint,
@@ -411,6 +446,7 @@ pub(crate) fn receive_output_request_with_uri(
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     let escaped_command_id = xml_escape(command_id);
     format!(
@@ -436,6 +472,7 @@ pub(crate) fn signal_terminate_request(
     command_id: &str,
     timeout_secs: u64,
     max_envelope_size: u32,
+    session_id: Uuid,
 ) -> String {
     let header = build_header(
         endpoint,
@@ -443,6 +480,7 @@ pub(crate) fn signal_terminate_request(
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     let escaped_command_id = xml_escape(command_id);
     format!(
@@ -466,6 +504,7 @@ pub(crate) fn delete_shell_request(
     shell_id: &str,
     timeout_secs: u64,
     max_envelope_size: u32,
+    session_id: Uuid,
 ) -> String {
     let header = build_header(
         endpoint,
@@ -473,6 +512,7 @@ pub(crate) fn delete_shell_request(
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     format!(
         r"<s:Envelope {NS_DECL_NO_RSP}>
@@ -492,6 +532,7 @@ pub(crate) fn disconnect_shell_request(
     shell_id: &str,
     timeout_secs: u64,
     max_envelope_size: u32,
+    session_id: Uuid,
 ) -> String {
     let header = build_header(
         endpoint,
@@ -499,6 +540,7 @@ pub(crate) fn disconnect_shell_request(
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     // The body carries the idle timeout the server should honour while
     // the shell is disconnected. We reuse `timeout_secs` for both so the
@@ -524,6 +566,7 @@ pub(crate) fn reconnect_shell_request(
     shell_id: &str,
     timeout_secs: u64,
     max_envelope_size: u32,
+    session_id: Uuid,
 ) -> String {
     reconnect_shell_request_with_uri(
         endpoint,
@@ -531,6 +574,7 @@ pub(crate) fn reconnect_shell_request(
         timeout_secs,
         max_envelope_size,
         RESOURCE_URI_CMD,
+        session_id,
     )
 }
 
@@ -540,6 +584,7 @@ pub(crate) fn disconnect_shell_request_with_uri(
     timeout_secs: u64,
     max_envelope_size: u32,
     resource_uri: &str,
+    session_id: Uuid,
 ) -> String {
     let header = build_header_for(
         endpoint,
@@ -548,6 +593,7 @@ pub(crate) fn disconnect_shell_request_with_uri(
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     format!(
         r"<s:Envelope {NS_DECL_WITH_RSP}>
@@ -567,6 +613,7 @@ pub(crate) fn reconnect_shell_request_with_uri(
     timeout_secs: u64,
     max_envelope_size: u32,
     resource_uri: &str,
+    session_id: Uuid,
 ) -> String {
     let header = build_header_for(
         endpoint,
@@ -575,6 +622,7 @@ pub(crate) fn reconnect_shell_request_with_uri(
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     format!(
         r"<s:Envelope {NS_DECL_WITH_RSP}>
@@ -599,6 +647,7 @@ pub(crate) fn send_input_request(
     end_of_stream: bool,
     timeout_secs: u64,
     max_envelope_size: u32,
+    session_id: Uuid,
 ) -> String {
     send_input_request_with_uri(
         endpoint,
@@ -609,6 +658,7 @@ pub(crate) fn send_input_request(
         timeout_secs,
         max_envelope_size,
         RESOURCE_URI_CMD,
+        session_id,
     )
 }
 
@@ -622,6 +672,7 @@ pub(crate) fn send_input_request_with_uri(
     timeout_secs: u64,
     max_envelope_size: u32,
     resource_uri: &str,
+    session_id: Uuid,
 ) -> String {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as B64;
@@ -633,6 +684,7 @@ pub(crate) fn send_input_request_with_uri(
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     let encoded_data = B64.encode(data);
     let end_attr = if end_of_stream { r#" End="true""# } else { "" };
@@ -657,6 +709,7 @@ pub(crate) fn send_psrp_request(
     timeout_secs: u64,
     max_envelope_size: u32,
     resource_uri: &str,
+    session_id: Uuid,
 ) -> String {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as B64;
@@ -668,6 +721,7 @@ pub(crate) fn send_psrp_request(
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     let encoded_data = B64.encode(data);
     format!(
@@ -692,6 +746,7 @@ pub(crate) fn signal_ctrl_c_request(
     command_id: &str,
     timeout_secs: u64,
     max_envelope_size: u32,
+    session_id: Uuid,
 ) -> String {
     let header = build_header(
         endpoint,
@@ -699,6 +754,7 @@ pub(crate) fn signal_ctrl_c_request(
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     let escaped_command_id = xml_escape(command_id);
     format!(
@@ -723,6 +779,7 @@ pub(crate) fn enumerate_wql_request(
     wql_namespace: Option<&str>,
     timeout_secs: u64,
     max_envelope_size: u32,
+    session_id: Uuid,
 ) -> String {
     let ns = wql_namespace.unwrap_or("root/cimv2");
     let resource_uri = format!("http://schemas.microsoft.com/wbem/wsman/1/wmi/{ns}/*");
@@ -733,6 +790,7 @@ pub(crate) fn enumerate_wql_request(
         None,
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     let escaped_query = xml_escape(wql_query);
     format!(
@@ -756,6 +814,7 @@ pub(crate) fn pull_request(
     enumeration_context: &str,
     timeout_secs: u64,
     max_envelope_size: u32,
+    session_id: Uuid,
 ) -> String {
     let header = build_header_for(
         endpoint,
@@ -764,6 +823,7 @@ pub(crate) fn pull_request(
         None,
         timeout_secs,
         max_envelope_size,
+        session_id,
     );
     let escaped_ctx = xml_escape(enumeration_context);
     format!(
@@ -784,6 +844,12 @@ pub(crate) fn pull_request(
 mod tests {
     use super::*;
 
+    /// Stable UUID for unit tests that do not assert SessionId text.
+    fn test_session_id() -> Uuid {
+        Uuid::nil()
+    }
+
+
     #[test]
     fn enumerate_wql_request_default_namespace() {
         let xml = enumerate_wql_request(
@@ -792,6 +858,7 @@ mod tests {
             None,
             60,
             153_600,
+            test_session_id(),
         );
         assert!(xml.contains("wbem/wsman/1/wmi/root/cimv2/*"));
         assert!(xml.contains("SELECT * FROM Win32_Service"));
@@ -807,6 +874,7 @@ mod tests {
             Some("root/StandardCimv2"),
             30,
             153_600,
+            test_session_id(),
         );
         assert!(xml.contains("root/StandardCimv2"));
         assert!(xml.contains("a &lt; b &amp; c"));
@@ -814,7 +882,8 @@ mod tests {
 
     #[test]
     fn pull_request_includes_context() {
-        let xml = pull_request("http://h/wsman", "ctx-<id>", 60, 153_600);
+        let xml = pull_request("http://h/wsman", "ctx-<id>", 60, 153_600, test_session_id(),
+        );
         assert!(xml.contains("Pull"));
         assert!(xml.contains("ctx-&lt;id&gt;"));
         assert!(xml.contains("EnumerationContext"));
@@ -842,6 +911,7 @@ mod tests {
             &["-EncodedCommand", "dGVzdA=="],
             60,
             153_600,
+            test_session_id(),
         );
         assert!(xml.contains("SHELL-123"));
         assert!(xml.contains("powershell.exe"));
@@ -851,7 +921,8 @@ mod tests {
 
     #[test]
     fn receive_request_contains_ids() {
-        let xml = receive_output_request("http://host:5985/wsman", "SHELL-1", "CMD-1", 60, 153_600);
+        let xml = receive_output_request("http://host:5985/wsman", "SHELL-1", "CMD-1", 60, 153_600, test_session_id(),
+        );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("CMD-1"));
         assert!(xml.contains("Receive"));
@@ -859,14 +930,16 @@ mod tests {
 
     #[test]
     fn delete_shell_contains_shell_id() {
-        let xml = delete_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153_600);
+        let xml = delete_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153_600, test_session_id(),
+        );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("transfer/Delete"));
     }
 
     #[test]
     fn signal_terminate_contains_required_elements() {
-        let xml = signal_terminate_request("http://host:5985/wsman", "S1", "C1", 60, 153_600);
+        let xml = signal_terminate_request("http://host:5985/wsman", "S1", "C1", 60, 153_600, test_session_id(),
+        );
         assert!(xml.contains("Signal"));
         assert!(xml.contains("S1"));
         assert!(xml.contains("C1"));
@@ -886,25 +959,29 @@ mod tests {
 
     #[test]
     fn max_envelope_size_appears_in_execute_command() {
-        let xml = execute_command_request("http://host:5985/wsman", "S1", "cmd", &[], 60, 256_000);
+        let xml = execute_command_request("http://host:5985/wsman", "S1", "cmd", &[], 60, 256_000, test_session_id(),
+        );
         assert!(xml.contains("256000"));
     }
 
     #[test]
     fn max_envelope_size_appears_in_receive_output() {
-        let xml = receive_output_request("http://host:5985/wsman", "S1", "C1", 60, 999_999);
+        let xml = receive_output_request("http://host:5985/wsman", "S1", "C1", 60, 999_999, test_session_id(),
+        );
         assert!(xml.contains("999999"));
     }
 
     #[test]
     fn max_envelope_size_appears_in_signal_terminate() {
-        let xml = signal_terminate_request("http://host:5985/wsman", "S1", "C1", 60, 200_000);
+        let xml = signal_terminate_request("http://host:5985/wsman", "S1", "C1", 60, 200_000, test_session_id(),
+        );
         assert!(xml.contains("200000"));
     }
 
     #[test]
     fn max_envelope_size_appears_in_delete_shell() {
-        let xml = delete_shell_request("http://host:5985/wsman", "S1", 60, 300_000);
+        let xml = delete_shell_request("http://host:5985/wsman", "S1", 60, 300_000, test_session_id(),
+        );
         assert!(xml.contains("300000"));
     }
 
@@ -918,6 +995,7 @@ mod tests {
             false,
             60,
             153_600,
+            test_session_id(),
         );
         assert!(xml.contains("Send"));
         assert!(xml.contains("S1"));
@@ -939,13 +1017,15 @@ mod tests {
             true,
             60,
             153_600,
+            test_session_id(),
         );
         assert!(xml.contains(r#"End="true""#));
     }
 
     #[test]
     fn signal_ctrl_c_contains_required_elements() {
-        let xml = signal_ctrl_c_request("http://host:5985/wsman", "S1", "C1", 60, 153_600);
+        let xml = signal_ctrl_c_request("http://host:5985/wsman", "S1", "C1", 60, 153_600, test_session_id(),
+        );
         assert!(xml.contains("Signal"));
         assert!(xml.contains("S1"));
         assert!(xml.contains("C1"));
@@ -955,7 +1035,8 @@ mod tests {
 
     #[test]
     fn signal_ctrl_c_max_envelope_size() {
-        let xml = signal_ctrl_c_request("http://host:5985/wsman", "S1", "C1", 60, 400_000);
+        let xml = signal_ctrl_c_request("http://host:5985/wsman", "S1", "C1", 60, 400_000, test_session_id(),
+        );
         assert!(xml.contains("400000"));
         assert!(!xml.contains("153600"));
     }
@@ -970,6 +1051,7 @@ mod tests {
             false,
             60,
             600_000,
+            test_session_id(),
         );
         assert!(xml.contains("600000"));
     }
@@ -997,6 +1079,7 @@ mod tests {
             &["arg</rsp:Arguments><injected>"],
             60,
             153_600,
+            test_session_id(),
         );
         assert!(!xml.contains("</rsp:Arguments><injected>"));
         assert!(xml.contains("&lt;/rsp:Arguments&gt;&lt;injected&gt;"));
@@ -1011,6 +1094,7 @@ mod tests {
             &[],
             60,
             153_600,
+            test_session_id(),
         );
         assert!(!xml.contains("<evil>"));
         assert!(xml.contains("cmd&lt;evil&gt;"));
@@ -1024,6 +1108,7 @@ mod tests {
             "CMD-1",
             60,
             153_600,
+            test_session_id(),
         );
         assert!(!xml.contains("SHELL<injected>"));
         assert!(xml.contains("SHELL&lt;injected&gt;"));
@@ -1032,7 +1117,8 @@ mod tests {
     #[test]
     fn receive_output_escapes_command_id() {
         let xml =
-            receive_output_request("http://host:5985/wsman", "S1", "CMD\"injected", 60, 153_600);
+            receive_output_request("http://host:5985/wsman", "S1", "CMD\"injected", 60, 153_600, test_session_id(),
+        );
         assert!(!xml.contains("CMD\"injected"));
         assert!(xml.contains("CMD&quot;injected"));
     }
@@ -1144,6 +1230,7 @@ mod tests {
             60,
             153_600,
             RESOURCE_URI_PSRP,
+            test_session_id(),
         );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("Invoke-Expression"));
@@ -1174,6 +1261,7 @@ mod tests {
             60,
             153_600,
             RESOURCE_URI_PSRP,
+            test_session_id(),
         );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("CMD-1"));
@@ -1193,6 +1281,7 @@ mod tests {
             60,
             153_600,
             RESOURCE_URI_PSRP,
+            test_session_id(),
         );
         assert!(xml.contains("<rsp:DesiredStream>stdout</rsp:DesiredStream>"));
         assert!(!xml.contains("CommandId"));
@@ -1209,6 +1298,7 @@ mod tests {
             60,
             153_600,
             custom_uri,
+            test_session_id(),
         );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("Get-Process"));
@@ -1228,6 +1318,7 @@ mod tests {
             60,
             153_600,
             custom_uri,
+            test_session_id(),
         );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("CMD-1"));
@@ -1238,7 +1329,8 @@ mod tests {
 
     #[test]
     fn disconnect_shell_contains_required_elements() {
-        let xml = disconnect_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153_600);
+        let xml = disconnect_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153_600, test_session_id(),
+        );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("shell/Disconnect"));
         assert!(xml.contains("Disconnect"));
@@ -1247,7 +1339,8 @@ mod tests {
 
     #[test]
     fn reconnect_shell_contains_required_elements() {
-        let xml = reconnect_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153_600);
+        let xml = reconnect_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153_600, test_session_id(),
+        );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("shell/Reconnect"));
         assert!(xml.contains("<rsp:Reconnect/>"));
@@ -1263,6 +1356,7 @@ mod tests {
             90,
             153_600,
             custom_uri,
+            test_session_id(),
         );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("shell/Disconnect"));
@@ -1279,6 +1373,7 @@ mod tests {
             60,
             153_600,
             custom_uri,
+            test_session_id(),
         );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("shell/Reconnect"));
@@ -1298,6 +1393,7 @@ mod tests {
             60,
             153_600,
             custom_uri,
+            test_session_id(),
         );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("CMD-1"));
@@ -1317,6 +1413,7 @@ mod tests {
             60,
             153_600,
             RESOURCE_URI_PSRP,
+            test_session_id(),
         );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("Send"));
@@ -1325,5 +1422,123 @@ mod tests {
         assert!(xml.contains("schemas.microsoft.com/powershell/Microsoft.PowerShell"));
         // No CommandId on the stream element for PSRP send
         assert!(!xml.contains("CommandId"));
+    }
+
+    #[test]
+    fn create_shell_includes_session_id_data_locale_and_wsmv_ns() {
+        let config = crate::config::WinrmConfig::default();
+        let xml = create_shell_request("http://host:5985/wsman", &config);
+        assert!(xml.contains("wsmv:SessionId"), "SessionId element required");
+        assert!(xml.contains("wsmv:DataLocale"), "DataLocale element required");
+        assert!(
+            xml.contains(r#"xmlns:wsmv="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd""#),
+            "xmlns:wsmv required"
+        );
+        let expected_sid = format!(
+            "uuid:{}",
+            config.session_id.hyphenated().to_string().to_uppercase()
+        );
+        assert!(
+            xml.contains(&expected_sid),
+            "SessionId must match config.session_id uppercase: {expected_sid}"
+        );
+    }
+
+    #[test]
+    fn session_id_stable_across_envelopes_message_id_differs() {
+        let config = crate::config::WinrmConfig::default();
+        let a = create_shell_request("http://host:5985/wsman", &config);
+        let b = create_shell_request("http://host:5985/wsman", &config);
+
+        let extract_session = |xml: &str| -> String {
+            let start = xml
+                .find("<wsmv:SessionId")
+                .expect("SessionId present")
+                + "<wsmv:SessionId".len();
+            let rest = &xml[start..];
+            let gt = rest.find('>').expect(">");
+            let end = rest[gt + 1..].find("</wsmv:SessionId>").expect("close");
+            rest[gt + 1..gt + 1 + end].to_string()
+        };
+        let extract_message = |xml: &str| -> String {
+            let start = xml.find("<wsa:MessageID>").expect("MessageID") + "<wsa:MessageID>".len();
+            let end = xml[start..].find("</wsa:MessageID>").expect("close");
+            xml[start..start + end].to_string()
+        };
+
+        assert_eq!(
+            extract_session(&a),
+            extract_session(&b),
+            "SessionId must be stable for one config"
+        );
+        assert_ne!(
+            extract_message(&a),
+            extract_message(&b),
+            "MessageID must differ per request"
+        );
+    }
+
+    #[test]
+    fn session_id_and_message_id_use_uppercase_uuid_hex() {
+        let config = crate::config::WinrmConfig::default();
+        let xml = create_shell_request("http://host:5985/wsman", &config);
+
+        fn check_upper_uuid(label: &str, text: &str) {
+            // uuid:XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+            let prefix = "uuid:";
+            assert!(text.starts_with(prefix), "{label} must start with uuid:");
+            let body = &text[prefix.len()..];
+            assert_eq!(body.len(), 36, "{label} UUID length");
+            for c in body.chars() {
+                assert!(
+                    c.is_ascii_digit() || ('A'..='F').contains(&c) || c == '-',
+                    "{label} must use uppercase hex A-F, got {c:?} in {body}"
+                );
+                assert!(
+                    !('a'..='f').contains(&c),
+                    "{label} must not contain lowercase hex: {body}"
+                );
+            }
+        }
+
+        let sid_start = xml.find("<wsmv:SessionId").unwrap();
+        let sid_gt = xml[sid_start..].find('>').unwrap() + sid_start;
+        let sid_end = xml[sid_gt + 1..].find("</wsmv:SessionId>").unwrap() + sid_gt + 1;
+        check_upper_uuid("SessionId", &xml[sid_gt + 1..sid_end]);
+
+        let mid_start = xml.find("<wsa:MessageID>").unwrap() + "<wsa:MessageID>".len();
+        let mid_end = xml[mid_start..].find("</wsa:MessageID>").unwrap() + mid_start;
+        check_upper_uuid("MessageID", &xml[mid_start..mid_end]);
+    }
+
+    #[test]
+    fn psrp_create_and_receive_include_session_id() {
+        let config = crate::config::WinrmConfig::default();
+        let create = create_psrp_shell_request(
+            "http://host:5985/wsman",
+            &config,
+            "AQAAAA==",
+            RESOURCE_URI_PSRP,
+            "PSRP-SHELL-1",
+        );
+        assert!(create.contains("wsmv:SessionId"));
+        assert!(create.contains("wsmv:DataLocale"));
+        assert!(create.contains(r#"xmlns:wsmv="#));
+
+        let recv = receive_psrp_request(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            Some("CMD-1"),
+            60,
+            153_600,
+            RESOURCE_URI_PSRP,
+            config.session_id,
+        );
+        assert!(recv.contains("wsmv:SessionId"));
+        let expected = format!(
+            "uuid:{}",
+            config.session_id.hyphenated().to_string().to_uppercase()
+        );
+        assert!(recv.contains(&expected));
     }
 }

@@ -137,6 +137,7 @@ impl WinrmClient {
             args,
             config.operation_timeout_secs,
             config.max_envelope_size,
+            config.session_id,
         );
         let response = self.transport.send_soap_with_retry(host, envelope).await?;
         soap::parse_command_id(&response).map_err(WinrmError::Soap)
@@ -160,6 +161,7 @@ impl WinrmClient {
             command_id,
             config.operation_timeout_secs,
             config.max_envelope_size,
+            config.session_id,
         );
         let response = self.transport.send_soap_with_retry(host, envelope).await?;
         soap::parse_receive_output(&response).map_err(WinrmError::Soap)
@@ -183,6 +185,7 @@ impl WinrmClient {
             command_id,
             config.operation_timeout_secs,
             config.max_envelope_size,
+            config.session_id,
         );
         self.transport.send_soap_with_retry(host, envelope).await?;
         Ok(())
@@ -202,6 +205,7 @@ impl WinrmClient {
             shell_id,
             config.operation_timeout_secs,
             config.max_envelope_size,
+            config.session_id,
         );
         self.transport.send_soap_with_retry(host, envelope).await?;
         Ok(())
@@ -382,6 +386,7 @@ impl WinrmClient {
             namespace,
             config.operation_timeout_secs,
             config.max_envelope_size,
+            config.session_id,
         );
         let response = self.transport.send_soap_with_retry(host, envelope).await?;
         let (mut items, mut context) =
@@ -396,6 +401,7 @@ impl WinrmClient {
                 &ctx,
                 config.operation_timeout_secs,
                 config.max_envelope_size,
+                config.session_id,
             );
             let pull_response = self
                 .transport
@@ -460,6 +466,7 @@ impl WinrmClient {
             config.operation_timeout_secs,
             config.max_envelope_size,
             resource_uri,
+            config.session_id,
         );
         self.transport.send_soap_with_retry(host, envelope).await?;
         debug!(shell_id = %shell_id, "WinRM shell reconnected");

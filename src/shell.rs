@@ -203,6 +203,7 @@ impl<'a> Shell<'a> {
                 config.operation_timeout_secs,
                 config.max_envelope_size,
                 &self.resource_uri,
+                config.session_id,
             )
         } else {
             soap::send_input_request_with_uri(
@@ -214,6 +215,7 @@ impl<'a> Shell<'a> {
                 config.operation_timeout_secs,
                 config.max_envelope_size,
                 &self.resource_uri,
+                config.session_id,
             )
         };
         self.client.send_soap_raw(&self.host, envelope).await?;
@@ -232,6 +234,7 @@ impl<'a> Shell<'a> {
             command_id,
             config.operation_timeout_secs,
             config.max_envelope_size,
+            config.session_id,
         );
         self.client.send_soap_raw(&self.host, envelope).await?;
         Ok(())
@@ -277,6 +280,7 @@ impl<'a> Shell<'a> {
             config.operation_timeout_secs,
             config.max_envelope_size,
             &self.resource_uri,
+            config.session_id,
         );
         let response = self.client.send_soap_raw(&self.host, envelope).await?;
         let returned_id = soap::parse_command_id(&response).map_err(WinrmError::Soap)?;
@@ -295,6 +299,7 @@ impl<'a> Shell<'a> {
             config.operation_timeout_secs,
             config.max_envelope_size,
             &self.resource_uri,
+            config.session_id,
         );
         let response = self.client.send_soap_raw(&self.host, envelope).await?;
         let command_id = soap::parse_command_id(&response).map_err(WinrmError::Soap)?;
@@ -325,6 +330,7 @@ impl<'a> Shell<'a> {
                 config.operation_timeout_secs,
                 config.max_envelope_size,
                 &self.resource_uri,
+                config.session_id,
             )
         } else {
             soap::receive_output_request_with_uri(
@@ -334,6 +340,7 @@ impl<'a> Shell<'a> {
                 config.operation_timeout_secs,
                 config.max_envelope_size,
                 &self.resource_uri,
+                config.session_id,
             )
         };
         let response = self.client.send_soap_raw(&self.host, envelope).await?;
@@ -370,6 +377,7 @@ impl<'a> Shell<'a> {
             config.operation_timeout_secs,
             config.max_envelope_size,
             &self.resource_uri,
+            config.session_id,
         );
         self.client.send_soap_raw(&self.host, envelope).await?;
         Ok(std::mem::take(&mut self.shell_id))
