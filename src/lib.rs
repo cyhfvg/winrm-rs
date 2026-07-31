@@ -30,6 +30,13 @@
 //! | Kerberos | [`AuthMethod::Kerberos`] | SPNEGO Negotiate via system Kerberos. Requires `kerberos` feature + `kinit`. |
 //! | Certificate | [`AuthMethod::Certificate`] | TLS client certificate. Set `client_cert_pem` and `client_key_pem` on config. |
 //!
+//! # Message encryption (`EncryptionMode`)
+//!
+//! For NTLM, [`EncryptionMode::Auto`] (the default) **seals** SOAP bodies on
+//! plain HTTP and **does not** seal by default on HTTPS (TLS already encrypts
+//! the channel). Hosts with `AllowUnencrypted=false` need sealing on HTTP.
+//! See [`EncryptionMode`] for `Always` / `Never`.
+//!
 //! # Error handling
 //!
 //! All fallible operations return `Result<T, WinrmError>`. The top-level
@@ -90,6 +97,8 @@ mod command;
 mod config;
 mod error;
 mod ntlm;
+/// Real PSRP PowerShell path (in-tree MS-PSRP framing under `src/psrp/`).
+mod psrp;
 mod shell;
 mod soap;
 mod tls;

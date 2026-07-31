@@ -6,7 +6,7 @@
 use tracing::debug;
 
 use crate::builder::WinrmClientBuilder;
-use crate::command::{CommandOutput, encode_powershell_command};
+use crate::command::CommandOutput;
 use crate::config::{WinrmConfig, WinrmCredentials};
 use crate::error::WinrmError;
 use crate::shell::Shell;
@@ -288,20 +288,22 @@ impl WinrmClient {
         })
     }
 
-    /// Run a PowerShell script on a remote host.
+    /// Run a PowerShell script on a remote host via real PSRP.
     ///
-    /// The script is encoded as UTF-16LE base64 and executed via
-    /// `powershell.exe -EncodedCommand`, which avoids quoting and escaping
-    /// issues. Internally delegates to [`run_command`](Self::run_command).
+    /// Opens a `Microsoft.PowerShell` runspace (MS-PSRP), creates a pipeline
+    /// for `script`, and collects stdout/stderr. This does **not** use a WinRS
+    /// cmd shell + `powershell.exe -EncodedCommand`, so accounts that only have
+    /// Invoke rights on the PowerShell plugin still work.
+    ///
+    /// Protocol framing is adapted from psrp-rs 1.0.0 (vendored: crates.io
+    /// `psrp-rs` depends on `winrm-rs` and cannot be linked from this crate).
     #[tracing::instrument(level = "debug", skip(self, script))]
     pub async fn run_powershell(
         &self,
         host: &str,
         script: &str,
     ) -> Result<CommandOutput, WinrmError> {
-        let encoded = encode_powershell_command(script);
-        self.run_command(host, "powershell.exe", &["-EncodedCommand", &encoded])
-            .await
+        crate::psrp::run_powershell(self, host, script).await
     }
 
     /// Execute a command with cancellation support.
@@ -339,14 +341,13 @@ impl WinrmClient {
         script: &str,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<CommandOutput, WinrmError> {
-        let encoded = encode_powershell_command(script);
-        self.run_command_with_cancel(
-            host,
-            "powershell.exe",
-            &["-EncodedCommand", &encoded],
-            cancel,
-        )
-        .await
+        if cancel.is_cancelled() {
+            return Err(WinrmError::Cancelled);
+        }
+        tokio::select! {
+            result = self.run_powershell(host, script) => result,
+            () = cancel.cancelled() => Err(WinrmError::Cancelled),
+        }
     }
 
     /// Execute a WQL query against WMI via WS-Enumeration.
@@ -637,42 +638,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_powershell_encodes_and_executes() {
+    async fn run_powershell_uses_psrp_path() {
+        // Basic-auth wiremock: open PSRP shell → RunspacePool Opened →
+        // CreatePipeline → PipelineOutput + Completed. Exercises the shipped
+        // `crate::psrp::run_powershell` path (not cmd + powershell.exe).
+        use base64::Engine;
+        use uuid::Uuid;
+
+        fn psrp_stream_body(payload: &[u8]) -> String {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+            format!(
+                r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell">
+                <s:Body><rsp:ReceiveResponse>
+                  <rsp:Stream Name="stdout">{b64}</rsp:Stream>
+                </rsp:ReceiveResponse></s:Body></s:Envelope>"#
+            )
+        }
+
+        // Build minimal PSRP fragment messages (same framing as src/psrp).
+        fn frag_msg(oid: u64, mt: u32, body: &str) -> Vec<u8> {
+            let mut msg = Vec::new();
+            msg.extend_from_slice(&1u32.to_le_bytes()); // destination client
+            msg.extend_from_slice(&mt.to_le_bytes());
+            msg.extend_from_slice(&Uuid::nil().to_bytes_le());
+            msg.extend_from_slice(&Uuid::nil().to_bytes_le());
+            msg.extend_from_slice(body.as_bytes());
+            let mut frag = Vec::new();
+            frag.extend_from_slice(&oid.to_be_bytes());
+            frag.extend_from_slice(&0u64.to_be_bytes());
+            frag.push(0x03); // start|end
+            frag.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+            frag.extend_from_slice(&msg);
+            frag
+        }
+
         let server = MockServer::start().await;
         let port = server.address().port();
 
-        // Shell create
+        // 1) Create PSRP shell
         Mock::given(method("POST"))
+            .and(wiremock::matchers::body_string_contains("creationXml"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S2</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+                r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell">
+                <s:Body><rsp:Shell><rsp:ShellId>PSRP-SHELL-1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
             ))
             .up_to_n_times(1)
             .mount(&server)
             .await;
 
-        // Command execute
+        // 2) Receive → RunspacePoolState Opened (code 2)
+        let opened = frag_msg(
+            10,
+            0x0002_1005,
+            r#"<Obj RefId="0"><MS><I32 N="RunspaceState">2</I32></MS></Obj>"#,
+        );
         Mock::given(method("POST"))
+            .and(wiremock::matchers::body_string_contains("Receive"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(psrp_stream_body(&opened)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // 3) Execute CreatePipeline
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::body_string_contains("CommandLine"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C2</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+                r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell">
+                <s:Body><rsp:CommandResponse><rsp:CommandId>PIPE-1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
             ))
             .up_to_n_times(1)
             .mount(&server)
             .await;
 
-        // Receive (done with exit code 0)
+        // 4) Receive → PipelineOutput + PipelineState Completed
+        let mut out_payload = frag_msg(11, 0x0004_1004, r#"<S>ok-from-psrp</S>"#);
+        out_payload.extend_from_slice(&frag_msg(
+            12,
+            0x0004_1006,
+            r#"<Obj RefId="0"><MS><I32 N="PipelineState">4</I32></MS></Obj>"#,
+        ));
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
-                    <rsp:CommandState CommandId="C2" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
-                        <rsp:ExitCode>0</rsp:ExitCode>
-                    </rsp:CommandState>
-                </rsp:ReceiveResponse></s:Body></s:Envelope>"#,
-            ))
+            .and(wiremock::matchers::body_string_contains("Receive"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(psrp_stream_body(&out_payload)))
             .up_to_n_times(1)
             .mount(&server)
             .await;
 
-        // Cleanup (signal + delete)
+        // 5) Delete / cleanup
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
@@ -682,10 +734,15 @@ mod tests {
 
         let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
         let output = client
-            .run_powershell("127.0.0.1", "Get-Process")
+            .run_powershell("127.0.0.1", "Write-Output 'ok-from-psrp'")
             .await
             .unwrap();
         assert_eq!(output.exit_code, 0);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("ok-from-psrp"),
+            "expected PSRP stdout, got: {stdout:?}"
+        );
     }
 
     #[tokio::test]

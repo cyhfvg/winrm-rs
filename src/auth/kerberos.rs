@@ -74,9 +74,10 @@ impl AuthTransport for KerberosAuth {
         }
 
         if !resp.status().is_success() {
-            let status = resp.status();
+            let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(WinrmError::AuthFailed(format!("HTTP {status}: {body}")));
+            // 401 already handled above; other statuses share NTLM layering.
+            return Err(WinrmError::from_http_status(status, body));
         }
 
         resp.text().await.map_err(WinrmError::Http)

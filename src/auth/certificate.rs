@@ -30,11 +30,16 @@ impl AuthTransport for CertificateAuth {
             .map_err(WinrmError::Http)?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
+            let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(WinrmError::AuthFailed(format!(
-                "Certificate auth HTTP {status}: {body}"
-            )));
+            // TLS client-cert rejection is often 401/403; other statuses
+            // (e.g. empty 500) must not look like bad credentials.
+            if status == 401 || status == 403 {
+                return Err(WinrmError::AuthFailed(format!(
+                    "Certificate auth HTTP {status}: {body}"
+                )));
+            }
+            return Err(WinrmError::from_http_status(status, body));
         }
 
         resp.text().await.map_err(WinrmError::Http)

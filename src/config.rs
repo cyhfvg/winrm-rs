@@ -118,17 +118,35 @@ impl Default for WinrmConfig {
 
 /// Controls whether NTLM message encryption (sealing) is applied to SOAP bodies.
 ///
-/// When using HTTP (not HTTPS), NTLM sealing encrypts the SOAP body to prevent
-/// eavesdropping. When using HTTPS, the TLS layer provides encryption, making
-/// sealing redundant.
+/// Sealing wraps the SOAP body as `multipart/encrypted` (MS-WSMV) so the
+/// payload is not sent in the clear over HTTP. Many WinRM hosts with
+/// `AllowUnencrypted=false` **require** sealing on plain HTTP.
+///
+/// # `Auto` (default)
+///
+/// | Transport | Sealing |
+/// |-----------|---------|
+/// | Plain **HTTP** (`use_tls = false`) | **On** — NTLM seal every SOAP body after a blank Type3 context setup |
+/// | **HTTPS** (`use_tls = true`) | **Off** by default — TLS already encrypts the channel |
+///
+/// # Other variants
+///
+/// - [`Always`](Self::Always): seal even over HTTPS (rarely needed).
+/// - [`Never`](Self::Never): never seal. On HTTP hosts that forbid unencrypted
+///   traffic this will fail; use only for debugging against hosts that allow
+///   cleartext SOAP.
+///
+/// Sealing applies only to [`AuthMethod::Ntlm`]. Basic/Kerberos/Certificate
+/// paths do not use NTLM message sealing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum EncryptionMode {
-    /// Encrypt when using HTTP, skip when using HTTPS (default).
+    /// Seal on plain HTTP; do **not** seal by default on HTTPS.
     #[default]
     Auto,
-    /// Always encrypt SOAP bodies, even over HTTPS.
+    /// Always seal SOAP bodies, even over HTTPS.
     Always,
-    /// Never encrypt SOAP bodies. **Use only for debugging.**
+    /// Never seal SOAP bodies. **Use only for debugging** (and only when the
+    /// server allows unencrypted WinRM).
     Never,
 }
 

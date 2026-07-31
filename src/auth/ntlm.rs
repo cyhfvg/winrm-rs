@@ -36,6 +36,9 @@ pub(crate) fn seal_body(session: &mut ntlm::NtlmSession, body: &str) -> (String,
     payload.extend_from_slice(&sig_len.to_le_bytes());
     payload.extend_from_slice(&sealed);
 
+    // Match pypsrp framing exactly: single CRLF after octet-stream header, then
+    // binary (no blank line). Trailing boundary is `--Encrypted Boundary--\r\n`
+    // without a leading CRLF (binary ends and boundary is concatenated).
     let header_part = format!(
         "{ENCRYPTED_BOUNDARY}\r\n\
          \tContent-Type: application/HTTP-SPNEGO-session-encrypted\r\n\
@@ -47,12 +50,16 @@ pub(crate) fn seal_body(session: &mut ntlm::NtlmSession, body: &str) -> (String,
 
     let mut mime_body = header_part.into_bytes();
     mime_body.extend_from_slice(&payload);
-    mime_body.extend_from_slice(format!("\r\n{ENCRYPTED_BOUNDARY}--\r\n").as_bytes());
+    // pypsrp: payload ends with `--Encrypted Boundary--\r\n` (no leading \r\n).
+    mime_body.extend_from_slice(format!("{ENCRYPTED_BOUNDARY}--\r\n").as_bytes());
 
     (ENCRYPTED_CONTENT_TYPE.to_string(), mime_body)
 }
 
 /// Extract and unseal the SOAP body from a multipart/encrypted response.
+///
+/// Unseal / MIME failures map to [`WinrmError::Ntlm`], not AuthFailed — a
+/// broken seal is a transport/protocol problem, not bad credentials.
 pub(crate) fn unseal_body(
     session: &mut ntlm::NtlmSession,
     data: &[u8],
@@ -63,13 +70,17 @@ pub(crate) fn unseal_body(
         .windows(marker.len())
         .position(|w| w == marker)
         .ok_or_else(|| {
-            WinrmError::AuthFailed("sealed response: missing octet-stream marker".into())
+            WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(
+                "sealed response: missing octet-stream marker".into(),
+            ))
         })?;
     let encrypted_start = pos + marker.len();
 
     // First 4 bytes = signature length (LE u32)
     if encrypted_start + 4 > data.len() {
-        return Err(WinrmError::AuthFailed("sealed response: truncated".into()));
+        return Err(WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(
+            "sealed response: truncated".into(),
+        )));
     }
     let sig_len = u32::from_le_bytes([
         data[encrypted_start],
@@ -80,8 +91,9 @@ pub(crate) fn unseal_body(
 
     let sealed_start = encrypted_start + 4;
 
-    // Find the end boundary
-    let end_marker = format!("\r\n{ENCRYPTED_BOUNDARY}--").into_bytes();
+    // Closing boundary is concatenated after ciphertext (no leading CRLF),
+    // matching pypsrp: `{cipher}--Encrypted Boundary--\r\n`.
+    let end_marker = format!("{ENCRYPTED_BOUNDARY}--").into_bytes();
     let sealed_end = data[sealed_start..]
         .windows(end_marker.len())
         .position(|w| w == end_marker.as_slice())
@@ -89,14 +101,17 @@ pub(crate) fn unseal_body(
 
     let sealed_data = &data[sealed_start..sealed_end];
     if sealed_data.len() < sig_len {
-        return Err(WinrmError::AuthFailed(
+        return Err(WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(
             "sealed response: data too short for signature".into(),
-        ));
+        )));
     }
 
     let plaintext = session.unseal(sealed_data).map_err(WinrmError::Ntlm)?;
-    String::from_utf8(plaintext)
-        .map_err(|e| WinrmError::AuthFailed(format!("sealed response: invalid UTF-8: {e}")))
+    String::from_utf8(plaintext).map_err(|e| {
+        WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(format!(
+            "sealed response: invalid UTF-8: {e}"
+        )))
+    })
 }
 
 impl NtlmAuth {
@@ -113,6 +128,19 @@ impl NtlmAuth {
     ) -> Result<(String, Zeroizing<[u8; 16]>), WinrmError> {
         let (response, session_key) = self.do_handshake(http, url, body, false).await?;
         Ok((response, session_key))
+    }
+
+    /// Perform the NTLM 3-step handshake and send the body **sealed** in Type3.
+    ///
+    /// Used as a fallback when connection-bound sealed POSTs without
+    /// Authorization are rejected (new TCP connection / no keep-alive).
+    pub(crate) async fn handshake_and_send_sealed(
+        &self,
+        http: &reqwest::Client,
+        url: &str,
+        body: &str,
+    ) -> Result<(String, Zeroizing<[u8; 16]>), WinrmError> {
+        self.do_handshake(http, url, body, true).await
     }
 
     /// Core NTLM handshake: Type 1 → Type 2 → Type 3.
@@ -231,12 +259,16 @@ impl NtlmAuth {
         };
         let auth_header = ntlm::encode_authorization(&type3);
 
-        // Apply NTLM sealing if requested (legacy path — doesn't work with WinRM
-        // servers since they can't process Auth + sealed body in one request).
-        let (content_type, request_body) = if seal {
-            let mut session = ntlm::NtlmSession::from_auth(&session_key);
-            let (ct, sealed) = seal_body(&mut session, body);
-            (ct, sealed)
+        // When `seal` is true, wrap the Type3 body as multipart/encrypted.
+        // Some WinRM builds accept Auth + sealed body on one request; others
+        // need blank Type3 then sealed follow-up (handled by the transport).
+        let mut seal_session = if seal {
+            Some(ntlm::NtlmSession::from_auth(&session_key))
+        } else {
+            None
+        };
+        let (content_type, request_body) = if let Some(ref mut session) = seal_session {
+            seal_body(session, body)
         } else {
             (
                 "application/soap+xml;charset=UTF-8".to_string(),
@@ -244,10 +276,17 @@ impl NtlmAuth {
             )
         };
 
-        let resp = http
+        // Never set Expect (including empty). pypsrp omits it entirely.
+        let mut req = http
             .post(url)
             .header(CONTENT_TYPE, &content_type)
-            .header(AUTHORIZATION, &auth_header)
+            .header(AUTHORIZATION, &auth_header);
+        // HTTPAPI requires Content-Length on empty POSTs; without it we get
+        // 411 Length Required and Connection: close (breaks NTLM affinity).
+        if request_body.is_empty() {
+            req = req.header("Content-Length", "0");
+        }
+        let resp = req
             .body(request_body)
             .send()
             .await
@@ -259,19 +298,39 @@ impl NtlmAuth {
             ));
         }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            if status.as_u16() == 500
-                && let Err(soap_err) = crate::soap::parser::check_soap_fault(&text)
-            {
-                return Err(WinrmError::Soap(soap_err));
-            }
-            return Err(WinrmError::AuthFailed(format!("HTTP {status}: {text}")));
+        // Blank Type-3 (empty body) establishes a sealable security context.
+        // WinRM may return non-2xx for empty POST while still accepting NTLM;
+        // only 401 means rejected credentials.
+        if body.is_empty() {
+            let _ = resp.bytes().await;
+            return Ok((String::new(), session_key));
         }
 
-        let response_text = resp.text().await.map_err(WinrmError::Http)?;
-        Ok((response_text, session_key))
+        let status = resp.status();
+        let resp_bytes = resp.bytes().await.map_err(WinrmError::Http)?;
+
+        let text = if let Some(ref mut session) = seal_session {
+            let looks_encrypted = resp_bytes
+                .windows(b"Encrypted Boundary".len())
+                .any(|w| w == b"Encrypted Boundary");
+            if looks_encrypted {
+                match unseal_body(session, &resp_bytes) {
+                    Ok(plain) => plain,
+                    Err(e) if status.is_success() => return Err(e),
+                    Err(_) => String::from_utf8_lossy(&resp_bytes).into_owned(),
+                }
+            } else {
+                String::from_utf8_lossy(&resp_bytes).into_owned()
+            }
+        } else {
+            String::from_utf8_lossy(&resp_bytes).into_owned()
+        };
+
+        if !status.is_success() {
+            return Err(WinrmError::from_http_status(status.as_u16(), text));
+        }
+
+        Ok((text, session_key))
     }
 }
 
