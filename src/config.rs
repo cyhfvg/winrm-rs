@@ -3,6 +3,7 @@
 // Contains WinrmConfig, AuthMethod, and WinrmCredentials extracted from client.rs.
 
 use secrecy::SecretString;
+use uuid::Uuid;
 
 /// Configuration for a [`WinrmClient`](crate::WinrmClient) connection.
 ///
@@ -89,6 +90,14 @@ pub struct WinrmConfig {
     /// and the shell is best-effort closed. Set to `None` to disable the
     /// cap (pre-1.1 behaviour).
     pub max_output_bytes: Option<usize>,
+    /// Microsoft WS-Man `SessionId` (`wsmv:SessionId`) — client-session-stable UUID.
+    ///
+    /// pypsrp / Windows clients send the same SessionId on every request for a
+    /// given client lifetime. Omitting it (or regenerating per request) causes
+    /// multi-second server-side stalls on some WinRM hosts when using NTLM
+    /// message sealing with PSRP. Generated once in [`Default::default()`] and
+    /// preserved across [`Clone`].
+    pub session_id: Uuid,
 }
 
 impl Default for WinrmConfig {
@@ -112,6 +121,7 @@ impl Default for WinrmConfig {
             env_vars: Vec::new(),
             idle_timeout_secs: None,
             max_output_bytes: Some(64 * 1024 * 1024),
+            session_id: Uuid::new_v4(),
         }
     }
 }
@@ -308,5 +318,19 @@ mod tests {
         let method = AuthMethod::Certificate;
         let debug = format!("{method:?}");
         assert!(debug.contains("Certificate"));
+    }
+
+    #[test]
+    fn session_id_stable_across_clone() {
+        let a = WinrmConfig::default();
+        let b = a.clone();
+        assert_eq!(a.session_id, b.session_id);
+    }
+
+    #[test]
+    fn session_id_differs_across_fresh_defaults() {
+        let a = WinrmConfig::default();
+        let c = WinrmConfig::default();
+        assert_ne!(a.session_id, c.session_id);
     }
 }
