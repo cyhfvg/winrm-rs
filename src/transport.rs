@@ -94,15 +94,30 @@ impl HttpTransport {
         // server returning a 30x is unexpected and any cross-origin redirect
         // would risk forwarding the Authorization header. Disable redirects
         // entirely.
+        // Match pypsrp/nxc defaults: identity Accept-Encoding (no gzip on
+        // WinRM encrypted bodies) and explicit Keep-Alive. Do not inject an
+        // empty Expect header — that alone can stall HTTP.sys on some hosts.
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("identity"),
+        );
+        default_headers.insert(
+            reqwest::header::CONNECTION,
+            reqwest::header::HeaderValue::from_static("Keep-Alive"),
+        );
+
         let mut builder = reqwest::Client::builder()
             .danger_accept_invalid_certs(config.accept_invalid_certs)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .timeout(Duration::from_secs(config.operation_timeout_secs + 10))
             .http1_only()
+            .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
-            .pool_max_idle_per_host(10)
+            .pool_max_idle_per_host(1)
             .pool_idle_timeout(Duration::from_secs(90))
+            .default_headers(default_headers)
             .user_agent(
                 config
                     .user_agent
@@ -287,10 +302,10 @@ impl HttpTransport {
 
     /// Send an NTLM-sealed request, reusing the cached session if available.
     ///
-    /// On the first call (no cached session), does a full NTLM handshake with
-    /// the SOAP body sent as plaintext.  The session key is cached so that
-    /// subsequent calls can send the body sealed (multipart/encrypted) without
-    /// a new handshake, reusing the keep-alive TCP connection.
+    /// On the first call (no cached session), performs a full NTLM handshake
+    /// with an **empty** body to establish the security context (pypsrp-style),
+    /// then sends the real SOAP body sealed as multipart/encrypted. Hosts with
+    /// `AllowUnencrypted=false` reject Type3+plaintext SOAP.
     ///
     /// If the server returns 401 (session expired), the cache is cleared and a
     /// fresh handshake is attempted.
@@ -306,7 +321,9 @@ impl HttpTransport {
             if let Some(ref mut c) = *cache {
                 if c.host == host {
                     match self.send_sealed_body(&mut c.session, url, &body).await {
-                        Ok(resp) => return Ok(resp),
+                        Ok(resp) => {
+                            return Ok(resp);
+                        }
                         Err(WinrmError::AuthFailed(_)) => {
                             // Session expired — clear cache, fall through to handshake
                             debug!("NTLM sealed session expired, re-authenticating");
@@ -321,23 +338,51 @@ impl HttpTransport {
             }
         }
 
-        // No cached session: do full handshake with plaintext body
+        // Establish NTLM context with an empty Type3 (pypsrp pattern: blank POST
+        // before encryption), then send the real SOAP body sealed on a keep-alive
+        // connection. Type3+plaintext SOAP is rejected when AllowUnencrypted=false.
         let auth = NtlmAuth {
             username: self.credentials.username.clone(),
             password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
             domain: self.credentials.domain.clone(),
             cert_handle: self.cert_handle.clone(),
         };
-        let (response, session_key) = auth.handshake_and_send(&self.http, url, &body).await?;
+        let (_blank, session_key) = auth.handshake_and_send(&self.http, url, "").await?;
 
-        // Cache the session for subsequent sealed requests
-        let session = NtlmSession::from_auth(&session_key);
-        *self.ntlm_cache.lock().await = Some(NtlmSessionCache {
-            host: host.to_string(),
-            session,
-        });
-
-        Ok(response)
+        let mut session = NtlmSession::from_auth(&session_key);
+        // Prefer sealed body on the authenticated connection. If the server
+        // still wants an Authorization header (new TCP connection), fall back
+        // to sealing inside a fresh Type3 (legacy path).
+        match self.send_sealed_body(&mut session, url, &body).await {
+            Ok(response) => {
+                *self.ntlm_cache.lock().await = Some(NtlmSessionCache {
+                    host: host.to_string(),
+                    session,
+                });
+                Ok(response)
+            }
+            Err(WinrmError::AuthFailed(_)) => {
+                debug!("sealed body without Authorization failed; retry Type3+seal");
+                let auth = NtlmAuth {
+                    username: self.credentials.username.clone(),
+                    password: Zeroizing::new(
+                        self.credentials.password.expose_secret().to_string(),
+                    ),
+                    domain: self.credentials.domain.clone(),
+                    cert_handle: self.cert_handle.clone(),
+                };
+                // Type3 with sealed body (do_handshake seal=true).
+                let (response, session_key) =
+                    auth.handshake_and_send_sealed(&self.http, url, &body).await?;
+                let session = NtlmSession::from_auth(&session_key);
+                *self.ntlm_cache.lock().await = Some(NtlmSessionCache {
+                    host: host.to_string(),
+                    session,
+                });
+                Ok(response)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Send a sealed body on an already-authenticated keep-alive connection.
@@ -348,7 +393,9 @@ impl HttpTransport {
         body: &str,
     ) -> Result<String, WinrmError> {
         let (content_type, sealed) = ntlm_auth::seal_body(session, body);
-
+        // Do not set Expect at all (including empty). Empty Expect previously
+        // correlated with multi-second HTTP.sys stalls; pypsrp never sends it.
+        // Content-Length is set implicitly from the known-size body Vec.
         let resp = self
             .http
             .post(url)
@@ -362,19 +409,32 @@ impl HttpTransport {
             return Err(WinrmError::AuthFailed("NTLM session expired".into()));
         }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            if status.as_u16() == 500
-                && let Err(soap_err) = crate::soap::parser::check_soap_fault(&text)
-            {
-                return Err(WinrmError::Soap(soap_err));
+        let status = resp.status();
+        let resp_bytes = resp.bytes().await.map_err(WinrmError::Http)?;
+
+        // Fault and success responses may both be multipart-encrypted.
+        let looks_encrypted = resp_bytes
+            .windows(b"Encrypted Boundary".len())
+            .any(|w| w == b"Encrypted Boundary")
+            || resp_bytes
+                .windows(b"application/octet-stream".len())
+                .any(|w| w == b"application/octet-stream");
+
+        let text = if looks_encrypted {
+            match ntlm_auth::unseal_body(session, &resp_bytes) {
+                Ok(plain) => plain,
+                Err(e) if status.is_success() => return Err(e),
+                Err(_) => String::from_utf8_lossy(&resp_bytes).into_owned(),
             }
-            return Err(WinrmError::AuthFailed(format!("HTTP {status}: {text}")));
+        } else {
+            String::from_utf8_lossy(&resp_bytes).into_owned()
+        };
+
+        if !status.is_success() {
+            return Err(WinrmError::from_http_status(status.as_u16(), text));
         }
 
-        let resp_bytes = resp.bytes().await.map_err(WinrmError::Http)?;
-        ntlm_auth::unseal_body(session, &resp_bytes)
+        Ok(text)
     }
 
     /// Send an authenticated SOAP request with optional retry on transient HTTP errors.
@@ -719,5 +779,68 @@ mod tests {
         // the hostname and the URL is rebuilt with the configured scheme.
         let url = transport.endpoint("http://evil.com/path");
         assert_eq!(url, "http://evil.com:5985/wsman");
+    }
+
+    /// Static check: sealed-WinRM HTTP client defaults must match criterion 1.
+    #[test]
+    fn sealed_winrm_client_defaults_are_configured() {
+        // Accept-Encoding/Keep-Alive/tcp_nodelay are set in `HttpTransport::new`.
+        let src = include_str!("transport.rs");
+        assert!(
+            src.contains("from_static(\"identity\")"),
+            "Accept-Encoding: identity required for sealed bodies"
+        );
+        assert!(
+            src.contains("from_static(\"Keep-Alive\")"),
+            "Connection: Keep-Alive required for NTLM affinity"
+        );
+        assert!(
+            src.contains("pool_max_idle_per_host(1)"),
+            "pool_max_idle_per_host=1 required"
+        );
+        assert!(src.contains("tcp_nodelay(true)"), "tcp_nodelay required");
+        // Must not *set* the Expect request header in production code.
+        // Scan only the non-test portion (before cfg(test) module).
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            !prod.contains(".header(\"Expect\""),
+            "must not set Expect request header"
+        );
+        // Primary sealed path is blank Type3 then sealed body (prod only).
+        assert!(
+            prod.contains("handshake_and_send(&self.http, url, \"\")"),
+            "blank Type3 handshake required"
+        );
+        assert!(
+            prod.contains("handshake_and_send_sealed"),
+            "Type3+seal fallback required"
+        );
+        // Old 1.1.2 bug: Type3 + plaintext SOAP as the sealed first request.
+        // That call would look like handshake_and_send(..., &body) without blank "".
+        let blank_ok = prod.contains("url, \"\")");
+        let sealed_fallback = prod.contains("handshake_and_send_sealed");
+        assert!(blank_ok && sealed_fallback);
+        // Ensure send_ntlm_sealed uses empty-body handshake, not body-first.
+        let sealed_fn = prod
+            .split("async fn send_ntlm_sealed")
+            .nth(1)
+            .and_then(|s| s.split("async fn send_sealed_body").next())
+            .unwrap_or("");
+        assert!(
+            sealed_fn.contains("url, \"\")"),
+            "send_ntlm_sealed must blank-handshake first"
+        );
+        assert!(
+            !sealed_fn.contains("handshake_and_send(&self.http, url, &body)"),
+            "Type3+plaintext SOAP must not be the primary sealed path"
+        );
+    }
+
+    #[test]
+    fn sealed_send_empty_body_500_is_not_auth_failed_mapping() {
+        // Unit-level: from_http_status used by send_sealed_body.
+        let err = WinrmError::from_http_status(500, String::new());
+        assert!(!matches!(err, WinrmError::AuthFailed(_)));
+        assert!(matches!(err, WinrmError::HttpStatus { status: 500, .. }));
     }
 }

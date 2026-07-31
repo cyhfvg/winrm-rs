@@ -100,6 +100,9 @@ impl WinrmClient {
     /// Download a file from a remote Windows host.
     ///
     /// Reads the file via PowerShell base64 encoding and decodes locally.
+    /// Uses a WinRS shell + `powershell.exe -EncodedCommand` (same path as
+    /// [`Self::upload_file`]), not the high-level PSRP `run_powershell`, so
+    /// file transfer stays independent of the PSRP runspace lifecycle.
     ///
     /// Returns the number of bytes downloaded.
     pub async fn download_file(
@@ -113,7 +116,10 @@ impl WinrmClient {
         let escaped = remote_path.replace('\'', "''");
         let script = format!("[Convert]::ToBase64String([IO.File]::ReadAllBytes('{escaped}'))");
 
-        let output = self.run_powershell(host, &script).await?;
+        let shell = self.open_shell(host).await?;
+        let output = shell.run_powershell(&script).await?;
+        shell.close().await.ok();
+
         if output.exit_code != 0 {
             return Err(WinrmError::Transfer(format!(
                 "download failed: {}",

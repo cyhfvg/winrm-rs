@@ -51,16 +51,17 @@ impl AuthTransport for BasicAuth {
             .map_err(WinrmError::Http)?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
+            let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            if status.as_u16() == 500
-                && let Err(soap_err) = crate::soap::parser::check_soap_fault(&body)
-            {
-                return Err(WinrmError::Soap(soap_err));
+            // 401/403 = credential / access rejection for Basic.
+            // Other statuses (empty 500, SOAP faults, …) use the shared
+            // layering so post-auth failures are not mislabeled AuthFailed.
+            if status == 401 || status == 403 {
+                return Err(WinrmError::AuthFailed(format!(
+                    "HTTP {status} from WinRM: {body}"
+                )));
             }
-            return Err(WinrmError::AuthFailed(format!(
-                "HTTP {status} from WinRM: {body}"
-            )));
+            return Err(WinrmError::from_http_status(status, body));
         }
 
         resp.text().await.map_err(WinrmError::Http)
@@ -143,7 +144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_500_without_soap_fault_returns_auth_failed() {
+    async fn send_500_without_soap_fault_returns_http_status_not_auth_failed() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal Error"))
@@ -152,6 +153,50 @@ mod tests {
 
         let http = reqwest::Client::new();
         let auth = BasicAuth::new("user", "pass");
+        let err = auth
+            .send_authenticated(&http, &server.uri(), "<soap/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WinrmError::HttpStatus { status: 500, .. }),
+            "expected HttpStatus, got: {err}"
+        );
+        assert!(
+            !matches!(err, WinrmError::AuthFailed(_)),
+            "empty/non-fault 500 must not be AuthFailed"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_empty_body_500_is_not_auth_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(""))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let auth = BasicAuth::new("user", "pass");
+        let err = auth
+            .send_authenticated(&http, &server.uri(), "<soap/>".into())
+            .await
+            .unwrap_err();
+        match err {
+            WinrmError::HttpStatus { status: 500, body } => assert!(body.is_empty()),
+            other => panic!("expected HttpStatus empty 500, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_401_returns_auth_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let auth = BasicAuth::new("user", "wrong");
         let err = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())
             .await

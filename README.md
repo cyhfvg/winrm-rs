@@ -77,6 +77,21 @@ let client = WinrmClient::new(
 )?;
 ```
 
+### Message encryption (`EncryptionMode`)
+
+NTLM can **seal** SOAP bodies (`multipart/encrypted`) so WinRM traffic is not
+sent as cleartext SOAP over HTTP. Controlled by [`EncryptionMode`](https://docs.rs/winrm-rs/latest/winrm_rs/enum.EncryptionMode.html)
+on [`WinrmConfig`](https://docs.rs/winrm-rs/latest/winrm_rs/struct.WinrmConfig.html):
+
+| Mode | Plain HTTP | HTTPS |
+|------|------------|--------|
+| **`Auto` (default)** | **Seal** (required by many hosts with `AllowUnencrypted=false`) | **Do not seal** (TLS already encrypts) |
+| `Always` | Seal | Seal |
+| `Never` | No seal (debug only; fails if the server forbids unencrypted WinRM) | No seal |
+
+Default `WinrmConfig` uses NTLM + HTTP + `EncryptionMode::Auto`, so plain HTTP
+connections seal after a blank NTLM Type3 context setup (pypsrp-compatible).
+
 ### Kerberos authentication
 
 ```rust

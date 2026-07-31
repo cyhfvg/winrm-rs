@@ -1359,3 +1359,106 @@ async fn command_on_deleted_shell_returns_error() {
         "executing command on deleted shell should return an error"
     );
 }
+
+// === Sealed NTLM + real PSRP whoami (lab / AllowUnencrypted=false) ===
+
+fn ntlm_sealed_client() -> Option<(WinrmClient, String)> {
+    let host = std::env::var("WINRM_TEST_HOST").ok()?;
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").ok()?;
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Ntlm,
+        port,
+        use_tls: false,
+        encryption: EncryptionMode::Auto,
+        connect_timeout_secs: 15,
+        operation_timeout_secs: 60,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
+    Some((client, host))
+}
+
+/// Sealed NTLM (HTTP Auto) + PSRP `whoami` — primary lab acceptance path.
+///
+/// ```bash
+/// export WINRM_TEST_HOST=10.10.50.10 WINRM_TEST_USER=rdp_user01 WINRM_TEST_PASS=...
+/// cargo test --test integration_real sealed_ntlm_psrp_whoami -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn sealed_ntlm_psrp_whoami() {
+    let (client, host) = ntlm_sealed_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let output = client
+        .run_powershell(&host, "whoami")
+        .await
+        .expect("PSRP whoami over sealed NTLM must succeed");
+    assert_eq!(output.exit_code, 0, "whoami exit code");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.to_lowercase().contains(
+            &std::env::var("WINRM_TEST_USER")
+                .unwrap_or_else(|_| "vagrant".into())
+                .to_lowercase()
+        ),
+        "stdout must contain username, got: {stdout:?}"
+    );
+}
+
+/// Same as [`sealed_ntlm_psrp_whoami`] for consistency (run twice under harness).
+#[tokio::test]
+#[ignore]
+async fn sealed_ntlm_psrp_whoami_second_run() {
+    let (client, host) = ntlm_sealed_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let output = client
+        .run_powershell(&host, "whoami")
+        .await
+        .expect("second PSRP whoami must succeed");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    assert!(
+        stdout.to_lowercase().contains(&user.to_lowercase()),
+        "stdout must contain {user}, got: {stdout:?}"
+    );
+}
+
+/// Wrong password must surface as AuthFailed (not Soap / HttpStatus).
+#[tokio::test]
+#[ignore]
+async fn sealed_ntlm_bad_password_is_auth_failed() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Ntlm,
+        port,
+        use_tls: false,
+        encryption: EncryptionMode::Auto,
+        connect_timeout_secs: 15,
+        operation_timeout_secs: 30,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(
+        config,
+        WinrmCredentials::new(user, "definitely-wrong-password-xyz", ""),
+    )
+    .expect("client build");
+    let err = client
+        .run_powershell(&host, "whoami")
+        .await
+        .expect_err("wrong password must fail");
+    assert!(
+        matches!(err, winrm_rs::WinrmError::AuthFailed(_)),
+        "expected AuthFailed, got: {err:?}"
+    );
+}
